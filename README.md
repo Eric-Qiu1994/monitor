@@ -116,7 +116,7 @@ journalctl -u monitor-agent -f
 monitor-agent \
   --url http://MONITOR_HOST:8080 \
   --token 'YOUR_TOKEN' \
-  --proxy http://172.16.1.1:1083 \
+  --proxy 代理地址 \
   --interval 10
 ```
 
@@ -125,7 +125,7 @@ monitor-agent \
 ```bash
 MONITOR_URL=http://MONITOR_HOST:8080 \
 MONITOR_TOKEN='YOUR_TOKEN' \
-MONITOR_PROXY=http://172.16.1.1:1083 \
+MONITOR_PROXY=代理地址 \
 MONITOR_PING_TARGET=1.1.1.1 \
 MONITOR_PING_COUNT=3 \
 monitor-agent
