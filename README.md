@@ -130,6 +130,19 @@ MONITOR_PING_TARGET=1.1.1.1 \
 MONITOR_PING_COUNT=3 \
 monitor-agent
 ```
+### 或者使用中心机器一键脚本
+
+安装：
+
+```bash
+curl -fsSL http://<中心机地址>/agent-bin/install.sh | sh -s -- http://<中心机地址> token
+```
+
+卸载：
+
+```bash
+curl -fsSL http://<中心机地址>/agent-bin/uninstall.sh | sh
+```
 
 ---
 
