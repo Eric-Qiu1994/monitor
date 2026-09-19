@@ -252,6 +252,9 @@ function probeSeries(hist) {
   }
   for (const rec of map.values()) {
     rec.lossRatePct = rec.totalCnt ? (rec.lossCnt / rec.totalCnt) * 100 : 0;
+    // 窗口内平均延迟：卡片展示用（区别于最新一次采集的单轮 ping 均值）
+    rec.avgLatency = rec.latency.length
+      ? rec.latency.reduce((a, p) => a + p.y, 0) / rec.latency.length : null;
   }
   return Array.from(map.values());
 }
@@ -285,7 +288,7 @@ function card(s, hist) {
     </div>`;
 
   // 探针（紧凑行）：多目标时每个占一格（名+延迟+丢包），不挤成一行
-  // 丢包率 = 所选时间范围内「有丢包的采集次数 / 总采集次数」（不是最新一次的值）
+  // 延迟 = 所选时间范围内全部采集的平均；丢包率 = 「有丢包的采集次数 / 总采集次数」
   const series = probeSeries(hist);
   const probes = (m.probes && m.probes.length) ? m.probes : (m.probe && m.probe.sent > 0 ? [m.probe] : []);
   let probeCells = '';
@@ -293,8 +296,10 @@ function card(s, hist) {
     if (!p.target) continue;
     const [alias, addr] = p.target.includes('|') ? p.target.split('|', 2) : [null, p.target];
     const label = (alias && alias.trim()) || addr;
-    const delay = p.latency_avg_ms == null ? '-' : `${p.latency_avg_ms.toFixed(1)}ms`;
     const sr = series.find(s => s.addr === addr);
+    // 有窗口数据用窗口平均；没有（如刚部署）退回最新一次
+    const lat = sr && sr.avgLatency != null ? sr.avgLatency : p.latency_avg_ms;
+    const delay = lat == null ? '-' : `${lat.toFixed(1)}ms`;
     const lossPct = sr ? sr.lossRatePct : 0;
     probeCells += `<span class="pg-name" title="${esc(label)}">${esc(label)}</span>
       <span class="pg-val">${delay} · ${lossPct.toFixed(1)}%</span>`;
