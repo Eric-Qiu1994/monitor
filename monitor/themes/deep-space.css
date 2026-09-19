@@ -1,0 +1,78 @@
+/* 深空青 — 深色底 + 青绿强调色 + 胶囊标签，参考 homa.de5.net 的观感。 */
+:root {
+  --bg: #0a0e17;
+  --card: #111c2e;
+  --border: rgba(255, 255, 255, 0.07);
+  --radius: 14px;
+  --shadow: 0 6px 28px rgba(0, 0, 0, 0.55);
+
+  --fg: #e6edf3;
+  --muted: #8b949e;
+  --accent: #2dd4bf;
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --err: #f43f5e;
+
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --font: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+}
+
+/* 背景：顶部略亮的渐变 + 左上青色光晕，纯装饰，不拦截点击 */
+body {
+  background: linear-gradient(180deg, #0f172a 0%, var(--bg) 320px) no-repeat var(--bg);
+  position: relative;
+}
+body::before {
+  content: "";
+  position: fixed;
+  top: -140px;
+  left: -100px;
+  width: 420px;
+  height: 420px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(45, 212, 191, 0.13), transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+/* 内容压在光晕之上 */
+.top, #cards {
+  position: relative;
+  z-index: 1;
+}
+
+.card, .panel {
+  box-shadow: var(--shadow);
+}
+
+/* 胶囊：在线徽章、日常标签全部全圆角 + 描边 */
+.pill {
+  border-radius: 999px;
+  border: 1px solid rgba(45, 212, 191, 0.3);
+  background: rgba(45, 212, 191, 0.1);
+  color: var(--accent);
+}
+
+/* 进度条：细长圆角 + 青→青蓝渐变，填充色按危险度降级 */
+.bar {
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+}
+.bar > i {
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), #22d3ee);
+}
+.bar.warn > i { background: linear-gradient(90deg, var(--warn), #f59e0b); }
+.bar.err > i { background: linear-gradient(90deg, var(--err), #e11d48); }
+
+/* 在线圆点带发光 */
+.dot.on { box-shadow: 0 0 8px var(--ok); }
+
+a { color: var(--accent); }
+a:hover { color: #5eead4; }
+
+/* section 标题与卡片标题区分层次 */
+h1 { font-weight: 700; letter-spacing: -0.01em; }
+.card h2 { font-weight: 600; }
+.section-h { letter-spacing: 0.04em; }

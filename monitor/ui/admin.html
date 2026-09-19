@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>后台管理 · 服务器探针</title>
+<link rel="stylesheet" href="/api/theme.css">
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+       font-family: var(--font); font-size: 14px; line-height: 1.5; display: flex; min-height: 100vh; }
+a { color: var(--accent); text-decoration: none; }
+/* 侧边栏 */
+aside { width: 180px; flex: none; background: var(--card); border-right: 1px solid var(--border);
+        padding: 16px 10px; display: flex; flex-direction: column; gap: 4px; }
+aside h1 { font-size: 15px; margin: 0 8px 14px; font-weight: 600; }
+aside button.nav { display: block; width: 100%; text-align: left; padding: 8px 12px; background: transparent;
+  color: var(--fg); border: 0; border-radius: var(--radius); cursor: pointer; font-size: 13px; }
+aside button.nav:hover { background: var(--bg); }
+aside button.nav.active { background: var(--accent); color: var(--bg); font-weight: 600; }
+aside .bottom { margin-top: auto; padding: 8px; }
+main { flex: 1; padding: 24px; min-width: 0; }
+main h2.ptitle { font-size: 18px; margin: 0 0 16px; font-weight: 600; }
+.muted { color: var(--muted); font-size: 12px; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; margin-bottom: 16px; }
+h3 { font-size: 14px; margin: 0 0 10px; font-weight: 600; }
+label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+input, textarea, select { width: 100%; padding: 7px 9px; background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--radius); font-family: var(--mono); font-size: 12px; }
+textarea { min-height: 260px; resize: vertical; }
+input[type=text], input[type=password], input[type=url], select { font-family: var(--font); }
+button { padding: 7px 14px; background: var(--accent); color: var(--bg); border: 0;
+  border-radius: var(--radius); cursor: pointer; font-size: 13px; font-weight: 600; }
+button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--border); }
+.btns { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+ul.list { list-style: none; margin: 0; padding: 0; }
+ul.list li { padding: 10px; border: 1px solid var(--border); border-radius: var(--radius);
+  margin-bottom: 8px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+ul.list li.active { border-color: var(--accent); }
+ul.list .nm { font-weight: 600; }
+.pill { display: inline-block; padding: 1px 8px; font-size: 11px; border: 1px solid var(--border);
+  color: var(--muted); border-radius: var(--radius); }
+.msg { margin-top: 10px; font-size: 12px; min-height: 18px; }
+.msg.ok { color: var(--ok); } .msg.err { color: var(--err); }
+.cols { display: grid; gap: 16px; grid-template-columns: 1fr 1fr; }
+@media (max-width: 900px) { body { flex-direction: column; } aside { width: 100%; flex-direction: row; flex-wrap: wrap; }
+  aside h1 { width: 100%; } .cols { grid-template-columns: 1fr; } }
+#login { max-width: 380px; margin: 10vh auto; }
+.hidden { display: none; }
+.page { display: none; } .page.active { display: block; }
+.checkline { display: flex; align-items: center; gap: 8px; margin: 10px 0; font-size: 13px; }
+.checkline input[type=checkbox] { width: auto; }
+</style>
+</head>
+<body>
+
+<!-- 登录 -->
+<div id="login" class="card" style="position:absolute;top:20vh;left:50%;transform:translateX(-50%)">
+  <h3>后台登录</h3>
+  <label for="lu">用户名</label>
+  <input id="lu" type="text" value="admin" autocomplete="username">
+  <label for="lp">密码</label>
+  <input id="lp" type="password" autocomplete="current-password">
+  <div class="btns"><button onclick="login()">登录</button></div>
+  <div id="loginMsg" class="msg"></div>
+  <div class="muted">默认账号 admin / admin，登录后请立即修改。</div>
+</div>
+
+<!-- 登录后的管理区 -->
+<aside id="panel" class="hidden">
+  <h1>后台管理</h1>
+  <button class="nav active" data-page="servers">服务器</button>
+  <button class="nav" data-page="sites">网站</button>
+  <button class="nav" data-page="system">系统设置</button>
+  <button class="nav" data-page="notify">通知设置</button>
+  <button class="nav" data-page="probe">延迟检测</button>
+  <button class="nav" data-page="themes">主题管理</button>
+  <button class="nav" data-page="account">账户设置</button>
+  <button class="nav" data-page="backup">备份恢复</button>
+  <button class="nav" data-page="about">关于</button>
+  <div class="bottom">
+    <a href="/">← 仪表盘</a><br><br>
+    <button class="ghost" onclick="logout()">退出登录</button>
+  </div>
+</aside>
+
+<main id="panelMain" class="hidden">
+
+  <!-- 服务器 -->
+  <div class="page active" id="page-servers">
+    <h2 class="ptitle">服务器</h2>
+    <div class="card">
+      <ul class="list" id="srvList"><li class="muted">加载中…</li></ul>
+      <div class="msg" id="srvMsg"></div>
+    </div>
+  </div>
+
+  <!-- 网站 -->
+  <div class="page" id="page-sites">
+    <h2 class="ptitle">网站监控</h2>
+    <div class="card">
+      <ul class="list" id="siteList"><li class="muted">加载中…</li></ul>
+      <div id="siteMsg" class="msg"></div>
+    </div>
+    <div class="card">
+      <h3 id="siteEditorTitle">添加网站</h3>
+      <label for="siteName">名称</label>
+      <input id="siteName" type="text" placeholder="我的博客">
+      <label for="siteUrl">URL（http:// 或 https://）</label>
+      <input id="siteUrl" type="url" placeholder="https://example.com">
+      <label for="siteInterval">检测间隔（秒，10–3600）</label>
+      <input id="siteInterval" type="number" min="10" max="3600" value="60">
+      <div class="checkline"><input id="siteEnabled" type="checkbox" checked><span>启用</span></div>
+      <div class="btns">
+        <button onclick="saveSite()" id="siteSaveBtn">添加</button>
+        <button class="ghost" onclick="resetSiteForm()">清空</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 系统设置 -->
+  <div class="page" id="page-system">
+    <h2 class="ptitle">系统设置</h2>
+    <div class="card">
+      <h3>仪表盘显示</h3>
+      <div class="checkline"><input id="setDiskTotal" type="checkbox"><span>硬盘只显示总大小（不显示每挂载点明细）</span></div>
+      <div class="checkline"><input id="setTraffic" type="checkbox"><span>显示流量统计（区间累计 + 总累计）</span></div>
+      <div class="checkline"><input id="setLatencyChart" type="checkbox"><span>显示延迟图表</span></div>
+      <div class="checkline"><input id="setLossChart" type="checkbox"><span>显示丢包率图表</span></div>
+      <div class="checkline"><input id="setCpuChart" type="checkbox"><span>显示 CPU 使用率图表</span></div>
+      <div style="display:flex;gap:24px;flex-wrap:wrap;margin-top:12px">
+        <div>
+          <label for="setProbeHours">延迟图表时间窗口（小时）</label>
+          <select id="setProbeHours">
+            <option value="4">4</option><option value="8">8</option>
+            <option value="12">12</option><option value="24">24</option>
+          </select>
+        </div>
+        <div>
+          <label for="setLossHours">丢包率图表时间窗口（小时）</label>
+          <select id="setLossHours">
+            <option value="4">4</option><option value="8">8</option>
+            <option value="12">12</option><option value="24">24</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>数据保留</h3>
+      <label for="setRetention">采样保留天数（1–365，0 表示用环境变量默认值）</label>
+      <input id="setRetention" type="number" min="0" max="365" value="0">
+      <label for="setReportInterval">Agent 上报间隔（秒，0 = 沿用 agent CLI 的 MONITOR_INTERVAL）</label>
+      <select id="setReportInterval">
+        <option value="0">沿用 agent 配置</option>
+        <option value="10">10 秒（默认）</option>
+        <option value="30">30 秒</option>
+        <option value="60">1 分钟</option>
+        <option value="120">2 分钟</option>
+        <option value="300">5 分钟</option>
+      </select>
+      <div class="btns">
+        <button onclick="saveSettings()">保存设置</button>
+        <button class="ghost" onclick="clearMetrics()">清空全部采集数据</button>
+      </div>
+      <div class="msg" id="setMsg"></div>
+    </div>
+    <div class="card">
+      <h3>后台设置</h3>
+      <label for="setAdminPath">后台入口路径（字母/数字/-
+_，默认 admin，即 /admin；保存后生效，需重启服务或重新进入）</label>
+      <input id="setAdminPath" type="text" maxlength="32" placeholder="admin">
+      <label for="setSiteTitle">顶部主标题（仪表盘 H1）</label>
+      <input id="setSiteTitle" type="text" maxlength="32" placeholder="服务器探针">
+      <label for="setPageTitle">网站标题（浏览器标签页）</label>
+      <input id="setPageTitle" type="text" maxlength="32" placeholder="服务器探针">
+      <div class="checkline"><input id="setAdminLink" type="checkbox"><span>在仪表盘显示"管理后台"入口链接</span></div>
+      <div class="btns"><button onclick="saveAdminSettings()">保存后台设置</button></div>
+      <div class="msg" id="adminSetMsg"></div>
+    </div>
+  </div>
+
+  <!-- 通知设置 -->
+  <div class="page" id="page-notify">
+    <h2 class="ptitle">通知设置</h2>
+    <div class="card">
+      <h3>Webhook 通知</h3>
+      <label for="nChannel">通知渠道</label>
+      <select id="nChannel">
+        <option value="generic">通用 Webhook（POST JSON）</option>
+        <option value="dingtalk">钉钉机器人</option>
+        <option value="feishu">飞书机器人</option>
+      </select>
+      <label for="nUrl">Webhook URL</label>
+      <input id="nUrl" type="url" placeholder="https://oapi.dingtalk.com/robot/send?access_token=...">
+      <label for="nSecret">加签密钥（钉钉/飞书，留空不加签）</label>
+      <input id="nSecret" type="text" placeholder="SEC...">
+      <div class="checkline"><input id="nOffline" type="checkbox" checked><span>服务器离线通知</span></div>
+      <div class="checkline"><input id="nSite" type="checkbox" checked><span>网站异常通知</span></div>
+      <div class="btns">
+        <button onclick="saveNotify()">保存通知设置</button>
+        <button class="ghost" onclick="testNotify()">发送测试通知</button>
+      </div>
+      <div class="msg" id="notifyMsg"></div>
+    </div>
+  </div>
+
+  <!-- 延迟检测 -->
+  <div class="page" id="page-probe">
+    <h2 class="ptitle">延迟检测</h2>
+    <div class="card">
+      <div class="row">
+        <span class="nm">每轮探测次数（对所有地址生效）</span>
+        <input id="pCount" type="number" min="1" max="10" value="3" style="width:72px">
+        <button onclick="saveProbeCount()">保存</button>
+      </div>
+      <ul class="list" id="probeList"><li class="muted">加载中…</li></ul>
+      <div id="probeMsg" class="msg"></div>
+    </div>
+    <div class="card">
+      <h3>添加探测地址</h3>
+      <label for="ptName">别名（仪表盘显示此名称）</label>
+      <input id="ptName" type="text" placeholder="Cloudflare">
+      <label for="ptTarget">地址（IP / 域名 / URL / host:port）</label>
+      <input id="ptTarget" type="text" placeholder="1.1.1.1">
+      <label for="ptMethod">探测方式</label>
+      <select id="ptMethod">
+        <option value="icmp">ICMP Ping</option>
+        <option value="http">HTTP Ping</option>
+        <option value="tcp">TCP Ping</option>
+      </select>
+      <div class="btns"><button onclick="addProbeTarget()">添加</button></div>
+      <div class="muted" style="margin-top:10px">agent 每个上报周期自动拉取此配置，改动最多滞后一个周期生效。</div>
+    </div>
+  </div>
+
+  <!-- 主题管理 -->
+  <div class="page" id="page-themes">
+    <h2 class="ptitle">主题管理</h2>
+    <div class="cols">
+      <div>
+        <div class="card">
+          <h3>主题列表</h3>
+          <ul class="list" id="list"></ul>
+          <div id="themeMsg" class="msg"></div>
+        </div>
+        <div class="card">
+          <h3>上传主题 CSS 文件</h3>
+          <input type="file" id="themeFile" accept=".css,text/css" style="font-size:12px">
+          <div class="muted" style="margin-top:8px">读取文件内容填入下方编辑器，填好名称后点「新建」。</div>
+        </div>
+      </div>
+      <div>
+        <div class="card">
+          <h3 id="editorTitle">新建主题</h3>
+          <label for="name">名称</label>
+          <input id="name" type="text" placeholder="例如：赛博紫">
+          <label for="desc">描述</label>
+          <input id="desc" type="text" placeholder="可选">
+          <label for="css">CSS（可完全覆盖仪表盘样式，不限颜色）</label>
+          <textarea id="css" spellcheck="false">:root {
+  --bg: #120b1f;
+  --fg: #e6d9ff;
+  --accent: #b388ff;
+}</textarea>
+          <div class="btns">
+            <button onclick="saveTheme()" id="saveBtn">新建</button>
+            <button class="ghost" onclick="resetForm()">清空表单</button>
+          </div>
+          <div class="muted" style="margin-top:10px">禁止 <code>&lt;/style&gt;</code>、<code>&lt;script&gt;</code>、<code>@import</code>、<code>javascript:</code>。</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 账户设置 -->
+  <div class="page" id="page-account">
+    <h2 class="ptitle">账户设置</h2>
+    <div class="card">
+      <h3>修改后台账号</h3>
+      <label for="cuOld">当前用户名</label>
+      <input id="cuOld" type="text" autocomplete="username">
+      <label for="cpOld">当前密码</label>
+      <input id="cpOld" type="password" autocomplete="current-password">
+      <label for="cuNew">新用户名</label>
+      <input id="cuNew" type="text" placeholder="可保持不变">
+      <label for="cpNew">新密码（至少 6 位）</label>
+      <input id="cpNew" type="password" autocomplete="new-password">
+      <div class="btns">
+        <button onclick="saveCreds()">保存账号</button>
+      </div>
+      <div class="msg" id="credMsg"></div>
+    </div>
+  </div>
+
+  <!-- 备份恢复 -->
+  <div class="page" id="page-backup">
+    <h2 class="ptitle">备份恢复</h2>
+    <div class="card">
+      <h3>备份</h3>
+      <div class="btns">
+        <button onclick="doBackup('settings')">仅备份设置</button>
+        <button onclick="doBackup('full')">完整备份（含历史数据）</button>
+      </div>
+      <div class="muted" style="margin-top:8px">
+        完整备份还包含所有服务器的 CPU / 内存 / 磁盘 / 流量 / 探针历史记录。文件可能较大（每服务器每天几十 KB）。
+      </div>
+      <div class="msg" id="backupMsg"></div>
+    </div>
+    <div class="card">
+      <h3>从备份恢复</h3>
+      <input type="file" id="restoreFile" accept=".json,application/json" style="font-size:12px">
+      <div class="btns" style="margin-top:12px"><button onclick="doRestore()">恢复</button></div>
+      <div class="muted" style="margin-top:8px">
+        恢复时若备份中包含历史数据，<b>将先清空再插入</b>。仅设置备份不会影响历史数据。
+      </div>
+      <div class="msg" id="restoreMsg"></div>
+    </div>
+  </div>
+
+  <!-- 关于 -->
+  <div class="page" id="page-about">
+    <h2 class="ptitle">关于</h2>
+    <div class="card">
+      <h3>本机资源（中心机）</h3>
+      <div id="hostStats"><p class="muted">加载中…</p></div>
+    </div>
+    <div class="card">
+      <h3>服务器探针</h3>
+      <p class="muted">Rust 轻量服务器探针：主服务（axum + SQLite）+ agent（sysinfo 采集、ICMP/HTTP/TCP 探测）。</p>
+      <p class="muted">功能：多服务器监控、多目标延迟探测、网站可用性监控、钉钉/飞书 Webhook 通知、主题自定义、备份恢复。</p>
+      <p class="muted">agent 部署见项目 docker.md。</p>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let session = sessionStorage.getItem('monitor_session') || '';
+let editingId = null, editingSiteId = null;
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function say(id, text, cls) { const m = $(id); m.textContent = text; m.className = 'msg ' + (cls || ''); }
+function headers(extra) {
+  return { 'Content-Type': 'application/json', 'x-admin-session': session, ...(extra || {}) };
+}
+async function api(method, url, body) {
+  const r = await fetch(url, { method, headers: headers(), body: body ? JSON.stringify(body) : undefined });
+  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  const ct = r.headers.get('content-type') || '';
+  return ct.includes('json') ? r.json() : r.text();
+}
+
+async function login() {
+  try {
+    const r = await fetch('/api/admin/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: $('lu').value.trim(), password: $('lp').value })
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const { session: s } = await r.json();
+    session = s; sessionStorage.setItem('monitor_session', s);
+    enter();
+  } catch (e) { say('loginMsg', '登录失败: ' + e.message, 'err'); }
+}
+async function logout() {
+  try { await api('POST', '/api/admin/logout'); } catch (_) {}
+  sessionStorage.removeItem('monitor_session'); session = '';
+  $('panel').classList.add('hidden'); $('panelMain').classList.add('hidden'); $('login').classList.remove('hidden');
+}
+function enter() {
+  $('login').classList.add('hidden');
+  $('panel').classList.remove('hidden'); $('panelMain').classList.remove('hidden');
+  loadServers(); loadProbeTargets(); loadSettings(); loadNotify(); loadThemes();
+}
+
+// ---------- 选项卡 ----------
+document.querySelectorAll('button.nav').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('button.nav').forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  $('page-' + b.dataset.page).classList.add('active');
+  const loaders = { servers: loadServers, sites: loadSites, probe: loadProbeTargets,
+                    notify: loadNotify, themes: loadThemes, system: loadSettings };
+  if (loaders[b.dataset.page]) loaders[b.dataset.page]();
+}));
+
+// ---------- 服务器 ----------
+async function loadServers() {
+  try {
+    const servers = await api('GET', '/api/servers');
+    $('srvList').innerHTML = servers.map(s => {
+      const m = s.latest || {};
+      const diskTotal = (m.disks || []).reduce((a, d) => a + (d.total || 0), 0);
+      return `<li>
+        <span class="nm">${esc(s.name)}</span>
+        <span class="muted">${esc(s.hostname)}</span>
+        <span class="pill">${s.online ? '在线' : '离线'}</span>
+        <span class="muted">磁盘 ${(diskTotal / 1073741824).toFixed(0)} GB</span>
+        <span class="spacer" style="flex:1"></span>
+        <button class="ghost" onclick="renameServer('${s.id}', '${esc(s.name)}')">改别名</button>
+        <button class="ghost" onclick="delServer('${s.id}', '${esc(s.name)}')">删除数据</button>
+      </li>`;
+    }).join('') || '<li class="muted">暂无服务器</li>';
+  } catch (e) {
+    if (String(e.message).startsWith('401')) return logout();
+    say('srvMsg', '读取失败: ' + e.message, 'err');
+  }
+}
+async function renameServer(id, cur) {
+  const name = prompt('新的服务器别名（1–64 字）', cur);
+  if (name == null) return;
+  const t = name.trim();
+  if (!t) return;
+  try { await api('PUT', `/api/servers/${id}`, { name: t }); say('srvMsg', '已改名', 'ok'); loadServers(); }
+  catch (e) { say('srvMsg', '失败: ' + e.message, 'err'); }
+}
+async function delServer(id, name) {
+  if (!confirm(`删除服务器「${name}」及其全部历史数据？此操作不可恢复。`)) return;
+  try { await api('DELETE', `/api/servers/${id}`); say('srvMsg', '已删除', 'ok'); loadServers(); }
+  catch (e) { say('srvMsg', '失败: ' + e.message, 'err'); }
+}
+
+// ---------- 网站 ----------
+async function loadSites() {
+  try {
+    const sites = await api('GET', '/api/admin/sites');
+    $('siteList').innerHTML = sites.map(s => `<li>
+      <span class="nm">${esc(s.name)}</span>
+      <span class="muted">${esc(s.url)}</span>
+      <span class="pill">${s.last_status >= 200 && s.last_status < 400 ? '正常 ' + s.last_status : (s.last_status ? '异常 ' + s.last_status : '未检测')}</span>
+      ${s.last_ms != null ? `<span class="muted">${s.last_ms.toFixed(0)} ms</span>` : ''}
+      <span class="muted">${s.interval_s}s</span>
+      ${s.enabled ? '' : '<span class="pill">已停用</span>'}
+      <span style="flex:1"></span>
+      <button class="ghost" onclick="editSite(${s.id})">编辑</button>
+      <button class="ghost" onclick="delSite(${s.id}, '${esc(s.name)}')">删除</button>
+    </li>`).join('') || '<li class="muted">暂无网站</li>';
+  } catch (e) {
+    if (String(e.message).startsWith('401')) return logout();
+    say('siteMsg', '读取失败: ' + e.message, 'err');
+  }
+}
+async function editSite(id) {
+  const sites = await api('GET', '/api/admin/sites');
+  const s = sites.find(x => x.id === id);
+  if (!s) return;
+  editingSiteId = id;
+  $('siteName').value = s.name; $('siteUrl').value = s.url;
+  $('siteInterval').value = s.interval_s; $('siteEnabled').checked = s.enabled;
+  $('siteEditorTitle').textContent = '编辑网站'; $('siteSaveBtn').textContent = '保存';
+}
+function resetSiteForm() {
+  editingSiteId = null;
+  $('siteEditorTitle').textContent = '添加网站'; $('siteSaveBtn').textContent = '添加';
+  $('siteName').value = ''; $('siteUrl').value = ''; $('siteInterval').value = 60; $('siteEnabled').checked = true;
+}
+async function saveSite() {
+  const body = {
+    id: editingSiteId, name: $('siteName').value.trim(), url: $('siteUrl').value.trim(),
+    interval_s: Number($('siteInterval').value), enabled: $('siteEnabled').checked
+  };
+  try {
+    await api('POST', '/api/admin/sites', body);
+    say('siteMsg', '已保存', 'ok'); resetSiteForm(); loadSites();
+  } catch (e) { say('siteMsg', '失败: ' + e.message, 'err'); }
+}
+async function delSite(id, name) {
+  if (!confirm(`删除网站「${name}」？`)) return;
+  try { await api('DELETE', `/api/admin/sites/${id}`); say('siteMsg', '已删除', 'ok'); loadSites(); }
+  catch (e) { say('siteMsg', '失败: ' + e.message, 'err'); }
+}
+
+// ---------- 系统设置 ----------
+async function loadSettings() {
+  try {
+    const s = await api('GET', '/api/admin/settings');
+    $('setDiskTotal').checked = s.dash_disks_total_only;
+    $('setTraffic').checked = s.dash_show_traffic;
+    $('setLatencyChart').checked = s.dash_show_latency_chart;
+    $('setLossChart').checked = s.dash_show_loss_chart;
+    $('setCpuChart').checked = s.dash_show_cpu_chart;
+    $('setRetention').value = s.retention_days;
+    $('setReportInterval').value = String(s.report_interval || 0);
+    $('setProbeHours').value = String(s.dash_probe_hours || 8);
+    $('setLossHours').value = String(s.dash_loss_hours || 8);
+    $('setAdminPath').value = s.admin_path || 'admin';
+    $('setAdminLink').checked = s.dash_show_admin_link !== false;
+    $('setSiteTitle').value = s.site_title || '服务器探针';
+    $('setPageTitle').value = s.page_title || '服务器探针';
+  } catch (e) {
+    if (String(e.message).startsWith('401')) return logout();
+  }
+}
+async function saveSettings() {
+  try {
+    await api('PUT', '/api/admin/settings', {
+      dash_disks_total_only: $('setDiskTotal').checked,
+      dash_show_traffic: $('setTraffic').checked,
+      dash_show_latency_chart: $('setLatencyChart').checked,
+      dash_show_loss_chart: $('setLossChart').checked,
+      dash_show_cpu_chart: $('setCpuChart').checked,
+      retention_days: Number($('setRetention').value),
+      report_interval: Number($('setReportInterval').value),
+      dash_probe_hours: Number($('setProbeHours').value),
+      dash_loss_hours: Number($('setLossHours').value)
+    });
+    say('setMsg', '已保存', 'ok');
+  } catch (e) { say('setMsg', '失败: ' + e.message, 'err'); }
+}
+
+async function clearMetrics() {
+  if (!confirm('清空所有服务器的延迟、丢包、CPU 等全部采集数据？服务器列表和配置保留，此操作不可恢复。')) return;
+  try {
+    const r = await api('DELETE', '/api/admin/metrics');
+    say('setMsg', `已清空 ${r.deleted} 条采集数据`, 'ok');
+  } catch (e) { say('setMsg', '失败: ' + e.message, 'err'); }
+}
+
+// ---------- 后台设置 ----------
+async function saveAdminSettings() {
+  const p = $('setAdminPath').value.trim();
+  if (p && !/^[A-Za-z0-9_-]{1,32}$/.test(p)) {
+    say('adminSetMsg', '路径只能包含字母/数字/-/_，最长 32 字符', 'err'); return;
+  }
+  try {
+    await api('PUT', '/api/admin/settings', {
+      admin_path: p || 'admin',
+      dash_show_admin_link: $('setAdminLink').checked,
+      site_title: $('setSiteTitle').value.trim() || '服务器探针',
+      page_title: $('setPageTitle').value.trim() || '服务器探针'
+    });
+    say('adminSetMsg', '已保存（新入口 /' + (p || 'admin') + '，重启服务后完全生效）', 'ok');
+  } catch (e) { say('adminSetMsg', '失败: ' + e.message, 'err'); }
+}
+
+// ---------- 本机资源（关于页，3s 轮询） ----------
+const fmtB = n => {
+  if (n == null) return '-';
+  const u = ['B','K','M','G','T']; let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v < 10 && i > 0 ? 2 : 0) + u[i];
+};
+let hostTimer = null;
+async function loadHostStats() {
+  try {
+    const s = await api('GET', '/api/admin/host-stats');
+    const memP = s.mem_total ? (s.mem_used / s.mem_total * 100).toFixed(1) : 0;
+    const swapP = s.swap_total ? (s.swap_used / s.swap_total * 100).toFixed(1) : 0;
+    const disks = (s.disks || []).map(d =>
+      `<div>硬盘 ${esc(d.mount)}：<b>${fmtB(d.used)}</b> / ${fmtB(d.total)}（${d.total ? (d.used / d.total * 100).toFixed(1) : 0}%）</div>`
+    ).join('');
+    $('hostStats').innerHTML = `
+      <div>CPU：${esc(s.cpu_name)} ×${s.cpu_cores}，使用率 <b>${s.cpu_usage.toFixed(1)}%</b></div>
+      <div>内存：<b>${fmtB(s.mem_used)}</b> / ${fmtB(s.mem_total)}（${memP}%），Swap <b>${fmtB(s.swap_used)}</b> / ${fmtB(s.swap_total)}（${swapP}%）</div>
+      ${disks}
+      <div>实时流量：↓ <b>${fmtB(s.net_rx_bps)}/s</b> ↑ <b>${fmtB(s.net_tx_bps)}/s</b></div>`;
+  } catch (e) {
+    if (String(e.message).startsWith('401')) { clearInterval(hostTimer); return logout(); }
+    $('hostStats').innerHTML = '<p class="muted">读取失败: ' + esc(e.message) + '</p>';
+  }
+}
+// 进入"关于"页时启动轮询，离开时停掉
+document.querySelectorAll('button.nav').forEach(b => b.addEventListener('click', () => {
+  if (b.dataset.page === 'about') { loadHostStats(); clearInterval(hostTimer); hostTimer = setInterval(loadHostStats, 3000); }
+  else clearInterval(hostTimer);
+}));
+
+// ---------- 通知设置 ----------
+async function loadNotify() {
+  try {
+    const c = await api('GET', '/api/admin/notify');
+    $('nChannel').value = c.channel; $('nUrl').value = c.url; $('nSecret').value = c.secret;
+    $('nOffline').checked = c.offline_on; $('nSite').checked = c.site_on;
+  } catch (e) {
+    if (String(e.message).startsWith('401')) return logout();
+    say('notifyMsg', '读取失败: ' + e.message, 'err');
+  }
+}
+async function saveNotify() {
+  try {
+    await api('PUT', '/api/admin/notify', {
+      channel: $('nChannel').value, url: $('nUrl').value.trim(),
+      secret: $('nSecret').value.trim(), offline_on: $('nOffline').checked, site_on: $('nSite').checked
+    });
+    say('notifyMsg', '已保存', 'ok');
+  } catch (e) { say('notifyMsg', '失败: ' + e.message, 'err'); }
+}
+async function testNotify() {
+  try {
+    await saveNotifyQuiet();
+    const r = await fetch('/api/admin/notify', {
+      method: 'POST', headers: headers(), body: JSON.stringify({ text: '测试通知：服务器探针通知通道正常。' })
+    });
+    if (!r.ok) throw new Error(await r.text());
+    say('notifyMsg', '测试通知已发送', 'ok');
+  } catch (e) { say('notifyMsg', '失败: ' + e.message, 'err'); }
+}
+async function saveNotifyQuiet() {
+  await api('PUT', '/api/admin/notify', {
+    channel: $('nChannel').value, url: $('nUrl').value.trim(),
+    secret: $('nSecret').value.trim(), offline_on: $('nOffline').checked, site_on: $('nSite').checked
+  });
+}
+
+// ---------- 延迟检测 ----------
+async function loadProbeTargets() {
+  try {
+    const targets = await api('GET', '/api/admin/probe-targets');
+    const cnt = await api('GET', '/api/admin/probe-config');
+    $('pCount').value = cnt.count ?? 3;
+    $('probeList').innerHTML = targets.map(t => `<li>
+      <span class="nm" style="${t.enabled ? '' : 'opacity:.45;text-decoration:line-through'}">${esc(t.name)}</span>
+      <span class="muted">${esc(t.target)}</span>
+      <span class="pill">${t.method}</span>
+      <span style="flex:1"></span>
+      <button class="ghost" onclick="toggleProbeTarget(${t.id}, ${!t.enabled})">${t.enabled ? '禁用' : '启用'}</button>
+      <button class="ghost" onclick="editProbeTarget(${t.id}, '${esc(t.name)}', '${esc(t.target)}', '${t.method}')">编辑</button>
+      <button class="ghost" onclick="delProbeTarget(${t.id}, '${esc(t.name)}')">删除</button>
+    </li>`).join('') || '<li class="muted">暂无探测地址</li>';
+  } catch (e) {
+    if (String(e.message).startsWith('401')) return logout();
+    say('probeMsg', '读取失败: ' + e.message, 'err');
+  }
+}
+async function saveProbeCount() {
+  try {
+    const count = Math.max(1, Math.min(10, Number($('pCount').value) || 3));
+    await api('PUT', '/api/admin/probe-config', { count });
+    say('probeMsg', '已保存，agent 下一轮生效', 'ok');
+  } catch (e) { say('probeMsg', '失败: ' + e.message, 'err'); }
+}
+async function editProbeTarget(id, name, target, method) {
+  const n = prompt('别名（仪表盘显示）', name); if (n === null) return;
+  const t = prompt('地址（IP / 域名 / host:port）', target); if (t === null) return;
+  try {
+    await api('PUT', `/api/admin/probe-targets/${id}`, {
+      name: n.trim(), target: t.trim(), method, enabled: true
+    });
+    say('probeMsg', '已更新，agent 下一轮生效', 'ok');
+    loadProbeTargets();
+  } catch (e) { say('probeMsg', '失败: ' + e.message, 'err'); }
+}
+async function toggleProbeTarget(id, enabled) {
+  try {
+    // PUT 需要全量字段；先从列表缓存拿当前值
+    const t = await api('GET', '/api/admin/probe-targets');
+    const cur = t.find(x => x.id === id); if (!cur) return;
+    await api('PUT', `/api/admin/probe-targets/${id}`, {
+      name: cur.name, target: cur.target, method: cur.method, enabled
+    });
+    say('probeMsg', enabled ? '已启用' : '已禁用（不再探测，配置保留）', 'ok');
+    loadProbeTargets();
+  } catch (e) { say('probeMsg', '失败: ' + e.message, 'err'); }
+}
+async function addProbeTarget() {
+  try {
+    await api('POST', '/api/admin/probe-targets', {
+      name: $('ptName').value.trim(), target: $('ptTarget').value.trim(), method: $('ptMethod').value
+    });
+    say('probeMsg', '已添加，agent 下一轮生效', 'ok');
+    $('ptName').value = ''; $('ptTarget').value = '';
+    loadProbeTargets();
+  } catch (e) { say('probeMsg', '失败: ' + e.message, 'err'); }
+}
+async function delProbeTarget(id, name) {
+  if (!confirm(`删除探测地址「${name}」？`)) return;
+  try { await api('DELETE', `/api/admin/probe-targets/${id}`); say('probeMsg', '已删除', 'ok'); loadProbeTargets(); }
+  catch (e) { say('probeMsg', '失败: ' + e.message, 'err'); }
+}
+
+// ---------- 主题 ----------
+async function loadThemes() {
+  try {
+    const { themes, active } = await api('GET', '/api/themes');
+    themeCache = themes;
+    $('list').innerHTML = themes.map(t => `
+      <li class="${t.name === active ? 'active' : ''}">
+        <span class="nm">${esc(t.name)}</span>
+        <span class="muted">${esc(t.description || '')}</span>
+        <span style="flex:1"></span>
+        ${t.name === active ? '<span class="pill">当前使用</span>'
+          : `<button class="ghost" onclick="activate('${esc(t.name)}')">启用</button>`}
+        <button class="ghost" onclick="editTheme(${t.id})">编辑</button>
+        ${t.builtin ? '<span class="pill">内置</span>'
+          : `<button class="ghost" onclick="delTheme(${t.id}, '${esc(t.name)}')">删除</button>`}
+      </li>`).join('') || '<li class="muted">暂无主题</li>';
+  } catch (e) {
+    if (String(e.message).startsWith('401')) return logout();
+    say('themeMsg', '读取失败: ' + e.message, 'err');
+  }
+}
+let themeCache = [];
+async function editTheme(id) {
+  if (!themeCache.length) themeCache = (await api('GET', '/api/themes')).themes;
+  const t = themeCache.find(x => x.id === id);
+  if (!t) return;
+  editingId = id;
+  $('name').value = t.name; $('desc').value = t.description; $('css').value = t.css;
+  $('editorTitle').textContent = `编辑主题：${t.name}`;
+  $('saveBtn').textContent = '保存修改';
+}
+function resetForm() {
+  editingId = null;
+  $('editorTitle').textContent = '新建主题';
+  $('saveBtn').textContent = '新建';
+  $('name').value = ''; $('desc').value = ''; $('css').value = ':root {\\n  --accent: #b388ff;\\n}';
+}
+async function saveTheme() {
+  const body = { name: $('name').value.trim(), description: $('desc').value.trim(), css: $('css').value };
+  try {
+    if (editingId) { await api('PUT', `/api/themes/${editingId}`, body); say('themeMsg', '已保存', 'ok'); }
+    else { await api('POST', '/api/themes', body); say('themeMsg', '已创建', 'ok'); }
+    resetForm(); loadThemes();
+  } catch (e) { say('themeMsg', '失败: ' + e.message, 'err'); }
+}
+async function delTheme(id, name) {
+  if (!confirm(`删除主题「${name}」？`)) return;
+  try { await api('DELETE', `/api/themes/${id}`); say('themeMsg', '已删除', 'ok'); loadThemes(); }
+  catch (e) { say('themeMsg', '失败: ' + e.message, 'err'); }
+}
+async function activate(name) {
+  try { await api('PUT', '/api/themes/active', { name }); say('themeMsg', `已切换到「${name}」`, 'ok'); loadThemes(); }
+  catch (e) { say('themeMsg', '失败: ' + e.message, 'err'); }
+}
+// 上传 CSS 文件
+$('themeFile') && $('themeFile').addEventListener('change', e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => { $('css').value = r.result; if (!$('name').value) $('name').value = f.name.replace(/\\.css$/i, ''); };
+  r.readAsText(f);
+});
+
+// ---------- 账户 ----------
+async function saveCreds() {
+  try {
+    await api('PUT', '/api/admin/credentials', {
+      old_username: $('cuOld').value.trim(), old_password: $('cpOld').value,
+      new_username: $('cuNew').value.trim(), new_password: $('cpNew').value
+    });
+    say('credMsg', '已保存，请重新登录', 'ok');
+    setTimeout(logout, 800);
+  } catch (e) { say('credMsg', '失败: ' + e.message, 'err'); }
+}
+
+// ---------- 备份恢复 ----------
+async function doBackup(mode) {
+  const full = mode === 'full';
+  try {
+    const data = await api('GET', '/api/admin/backup');
+    // 仅设置：剥掉历史指标，只留配置
+    const out = full ? data : { ...data, metrics: undefined };
+    const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `monitor-backup-${full ? 'full' : 'settings'}-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click(); URL.revokeObjectURL(url);
+    const n = Array.isArray(data.metrics) ? data.metrics.length : 0;
+    say('backupMsg', full ? `已下载 ${n} 条历史记录` : '已下载（仅设置）', 'ok');
+  } catch (e) { say('backupMsg', '失败: ' + e.message, 'err'); }
+}
+async function doRestore() {
+  const f = $('restoreFile').files[0];
+  if (!f) return say('restoreMsg', '请先选择备份文件', 'err');
+  let data;
+  try { data = JSON.parse(await f.text()); }
+  catch (_) { return say('restoreMsg', '不是合法的 JSON 文件', 'err'); }
+  const hasMetrics = Array.isArray(data.metrics) && data.metrics.length > 0;
+  if (!confirm(hasMetrics
+    ? `恢复含 ${data.metrics.length} 条历史记录，将先清空现有历史数据，继续？`
+    : '恢复将覆盖现有探测地址与网站列表，继续？')) return;
+  try {
+    await api('POST', '/api/admin/restore', data);
+    say('restoreMsg', hasMetrics ? '恢复成功（含历史数据）' : '恢复成功', 'ok');
+  } catch (e) { say('restoreMsg', '失败: ' + e.message, 'err'); }
+}
+
+// 已有会话直接进面板
+if (session) {
+  api('GET', '/api/admin/probe-config').then(enter).catch(logout);
+} else {
+  $('lp').focus();
+  $('lp').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,71 @@
+# 主服务：docker compose up -d
+# 先复制 .env.example 为 .env，务必替换 MONITOR_TOKEN。
+#
+# agent 通常跑在**被监控的目标主机**上，不跟 monitor 同机。
+# 推荐：每台目标机一份独立的 compose，仅含 agent（参见 agent.compose.yml）。
+# 下面默认配置不启动 agent，需要同机自监控时把下面 agent service 的注释去掉。
+services:
+  monitor:
+    build:
+      context: .
+      target: monitor-runtime
+    image: qjj223/monitor:latest
+    container_name: monitor
+    restart: unless-stopped
+    ports:
+      - "${MONITOR_PORT:-8080}:8080"
+    environment:
+      MONITOR_TOKEN: ${MONITOR_TOKEN:?请先在 .env 设置 MONITOR_TOKEN}
+      MONITOR_RETENTION_DAYS: ${MONITOR_RETENTION_DAYS:-7}
+      # 10 秒上报间隔下，20,000 条约 2.3 天；保留天数和条数双重兜底。
+      MONITOR_MAX_ROWS_PER_SERVER: ${MONITOR_MAX_ROWS_PER_SERVER:-20000}
+      MONITOR_CLEANUP_INTERVAL: ${MONITOR_CLEANUP_INTERVAL:-600}
+    volumes:
+      - monitor-data:/data
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -r /proc/1/cmdline"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    # 运行时只需 SQLite 数据目录写权限。
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    security_opt:
+      - no-new-privileges:true
+
+  # 跟 monitor 同机自监控：agent 通过 service 名直接访问 monitor。
+  # 上报地址、token 从宿主 .env 读；hostname 用容器 ID（每容器唯一）。
+  # ICMP 需要 NET_RAW；不需要的可以把 cap_drop 保留、去掉 cap_add。
+  agent:
+    build:
+      context: .
+      target: agent-runtime
+    image: qjj223/monitor-agent:latest
+    container_name: monitor-agent
+    restart: unless-stopped
+    depends_on:
+      monitor:
+        condition: service_healthy
+    environment:
+      MONITOR_URL: http://monitor:8080
+      MONITOR_TOKEN: ${MONITOR_TOKEN:?请先在 .env 设置 MONITOR_TOKEN}
+      MONITOR_INTERVAL: ${MONITOR_INTERVAL:-10}
+      MONITOR_HOSTNAME: ${MONITOR_HOSTNAME:-}
+      MONITOR_PROXY: ${MONITOR_PROXY:-}        # 空串 = 无代理
+      MONITOR_PING_METHOD: ${MONITOR_PING_METHOD:-icmp}
+      MONITOR_PING_COUNT: ${MONITOR_PING_COUNT:-3}
+      # 抵消宿主 ~/.docker/config.json proxies 段注入的 HTTP_PROXY
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    cap_add: ["NET_RAW"]   # icmp ping 用；纯 http/tcp 可删
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+
+volumes:
+  monitor-data:

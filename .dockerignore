@@ -1,0 +1,19 @@
+# Rust / build output
+target/
+
+# Local deployment data and secrets
+.env
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# VCS / editor
+.git/
+.gitignore
+.DS_Store
+.idea/
+.vscode/
+
+# Documentation and local artifacts are not required by the build context
+README.md

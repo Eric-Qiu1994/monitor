@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>服务器探针</title>
+<link rel="stylesheet" href="/api/theme.css">
+<style>
+/* 结构样式：所有主题共用，配色/字体/圆角由主题 CSS 变量决定 */
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: var(--bg); color: var(--fg);
+       font-family: var(--font); font-size: 14px; line-height: 1.5; }
+a { color: var(--accent); text-decoration: none; }
+.top { display: flex; align-items: baseline; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+h1 { font-size: 18px; margin: 0; font-weight: 600; }
+.muted { color: var(--muted); font-size: 12px; }
+.spacer { flex: 1; }
+/* 时间范围选择器：视觉走主题变量，不写死 */
+.range-pick { display: inline-flex; gap: 2px; }
+/* 图表抽屉里的范围行：标签左、按钮靠右 */
+.range-row { justify-content: space-between; align-items: center; }
+.range-pick button { background: transparent; color: var(--muted); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 3px 7px; font-size: 11px; font-family: inherit; cursor: pointer; }
+.range-pick button:hover { color: var(--fg); }
+.range-pick button.act { color: #fff; background: var(--accent); border-color: var(--accent); }
+/* 网格：320px 窄卡，多机并排 */
+.grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; }
+/* 头部：标题 + 状态徽章 + 图表按钮，一行 */
+.card h2 { font-size: 13px; margin: 0 0 2px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+.on { background: var(--ok); } .off { background: var(--muted); }
+.pill { display: inline-block; padding: 1px 8px; font-size: 11px; border: 1px solid var(--border); color: var(--muted); }
+.meta { margin: 4px 0 8px; font-size: 11px; color: var(--muted); }
+/* 图表按钮：紧贴状态徽章，点击展开/收起该服务器的图表 */
+.chart-btn { background: none; border: 1px solid var(--border); border-radius: 999px;
+             color: var(--muted); cursor: pointer; padding: 1px 6px; font-size: 11px; line-height: 1.4; }
+.chart-btn:hover { color: var(--accent); border-color: var(--accent); }
+.chart-btn[aria-expanded="true"] { color: var(--accent); border-color: var(--accent); }
+/* 指标网格：CPU/内存/磁盘三栏，每栏 标签+百分比 一行 + 细进度条 */
+.metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 2px 0 6px; }
+/* 磁盘明细模式：每挂载点占用一列，不超过 3 列 */
+.metrics.with-detail { grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); max-height: 64px; overflow: hidden; }
+.metric { min-width: 0; }
+.metric .lbl { font-size: 10px; color: var(--muted); }
+.metric .val { font-size: 13px; font-weight: 600; font-family: var(--mono); }
+.metric .sub { font-size: 10px; color: var(--muted); font-family: var(--mono);
+               white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar { height: 4px; background: var(--border); border-radius: 999px; overflow: hidden; margin-top: 3px; }
+.bar > i { display: block; height: 100%; background: var(--accent); }
+.bar.warn > i { background: var(--warn); } .bar.err > i { background: var(--err); }
+/* 折叠的图表区：默认隐藏，点按钮展开。
+   展开时绝对定位浮于卡片上方，不撑高整张卡。视觉细节全走主题变量。 */
+.drawer { display: none; }
+.drawer.open { display: block; position: absolute; left: 12px; right: 12px; z-index: 5;
+               padding: 10px 12px 12px;
+               border: 1px solid var(--border); background: var(--card);
+               box-shadow: var(--shadow); border-radius: var(--radius); }
+/* 让卡片成为定位上下文；展开时 z-index 提到最前，不被邻居遮挡 */
+.card { position: relative; }
+.card.has-open { z-index: 4; }
+/* 卡片底部一行：运行时长/最后上报/流量速率，挤在一行 */
+.foot { display: flex; gap: 10px; flex-wrap: wrap; font-size: 10px; color: var(--muted); margin-top: 6px; }
+.foot .v { font-family: var(--mono); }
+.axis { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted);
+        font-family: var(--mono); margin-top: 2px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; }
+td, th { text-align: left; padding: 2px 0; }
+td.v { text-align: right; font-family: var(--mono); }
+.empty { color: var(--muted); padding: 40px 0; text-align: center; }
+.section-h { margin: 14px 0 4px; font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
+.chart { width: 100%; height: 110px; display: block; margin-top: 4px; position: relative; }
+.chart .axis-y { position: absolute; top: 2px; right: 2px; font-size: 10px; color: var(--muted); font-family: var(--mono); }
+.legend { font-size: 11px; color: var(--muted); margin-top: 4px; display: flex; gap: 10px; flex-wrap: wrap; }
+.legend .lg { display: inline-flex; align-items: center; gap: 4px; cursor: default; }
+.legend .sw { width: 10px; height: 2px; display: inline-block; }
+.tip { position: absolute; background: var(--fg); color: var(--bg); font-size: 11px; padding: 4px 6px;
+       border-radius: 4px; pointer-events: none; white-space: pre; line-height: 1.4; z-index: 5;
+       font-family: var(--mono); }
+/* 抽屉里图表标题：分隔线 + 居左小标签 */
+.drawer .section-h { margin: 8px 0 2px; padding-top: 8px; border-top: 1px solid var(--border); }
+.drawer .section-h:first-child { border-top: none; padding-top: 0; }
+/* 多检测点行：每目标一行（名左、延迟+丢包右），多目标不乱 */
+.probe-grid { display: grid; grid-template-columns: 1fr auto;
+              row-gap: 2px; margin-top: 4px; font-size: 10px; color: var(--muted); }
+.probe-grid .pg-name { color: var(--fg); font-weight: 600; overflow: hidden;
+                       text-overflow: ellipsis; white-space: nowrap; }
+.probe-grid .pg-val { font-family: var(--mono); }
+</style>
+</head>
+<body>
+<div class="top">
+  <h1 id="siteTitle">服务器探针</h1>
+  <span class="muted" id="summary">加载中…</span>
+  <span class="spacer"></span>
+  <span class="muted" id="clock"></span>
+  <a href="/admin" id="adminLink">管理后台 →</a>
+</div>
+<div id="cards" class="grid"></div>
+
+<script>
+// 公共工具
+const fmtBytes = n => {
+  if (!n && n !== 0) return '-';
+  const u = ['B','K','M','G','T','P'];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v < 10 && i > 0 ? 2 : 0) + u[i];
+};
+const fmtUptime = s => {
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return d > 0 ? `${d}天${h}时` : h > 0 ? `${h}时${m}分` : `${m}分`;
+};
+const pct = (a, b) => b > 0 ? Math.min(100, a / b * 100) : 0;
+const barClass = p => p >= 90 ? 'bar err' : p >= 75 ? 'bar warn' : 'bar';
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// 记录哪些服务器的图表抽屉是展开的；自动刷新重渲染时不丢状态
+const drawerOpen = new Set();
+// 全局查看范围（小时）；持久化到 localStorage，所有卡片图表共用
+const RANGE_HOURS = [1, 4, 8, 12, 24];
+let viewHours = Math.min(24, Math.max(1, parseInt(localStorage.getItem('viewHours')) || 8));
+if (!RANGE_HOURS.includes(viewHours)) viewHours = 8;
+const fmtTime = ts => new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+const fmtDate = ts => new Date(ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+
+let dashCfg = { disksTotalOnly: true, showTraffic: true, probeHours: 8, lossHours: 8,
+                showLatencyChart: true, showLossChart: true, showCpuChart: true,
+                adminPath: '/admin', showAdminLink: true };
+fetch('/api/public/dash-config').then(r => r.json()).then(c => {
+  dashCfg = Object.assign(dashCfg, c);
+  // 后台入口：跟随配置的路径，可隐藏
+  const link = document.getElementById('adminLink');
+  if (dashCfg.showAdminLink === false) link.style.display = 'none';
+  else link.href = dashCfg.adminPath || '/admin';
+  // 标题：H1 与 <title> 分别可配
+  const st = dashCfg.siteTitle || '服务器探针';
+  document.getElementById('siteTitle').textContent = st;
+  document.title = dashCfg.pageTitle || st;
+  refresh();
+}).catch(() => { refresh(); });
+
+/// 一个紧凑指标块：上 lbl+val，下 sub+bar
+function metric(label, val, sub, used, total) {
+  const p = pct(used, total);
+  return `<div class="metric">
+    <div class="lbl">${label}</div>
+    <div class="val">${val}</div>
+    <div class="sub">${sub}</div>
+    <div class="${barClass(p)}"><i style="width:${p.toFixed(1)}%"></i></div>
+  </div>`;
+}
+
+function ago(ts) {
+  const d = (Date.now() - new Date(ts)) / 1000;
+  return d < 60 ? `${d | 0} 秒前` : d < 3600 ? `${d / 60 | 0} 分钟前` : `${d / 3600 | 0} 小时前`;
+}
+
+/// 单条折线图（CPU 用率那种），返回 svg + 时间段标注
+function sparkline(hist, pick, tall) {
+  const pts = hist.map(pick).filter(v => typeof v === 'number' && isFinite(v));
+  if (pts.length < 2) return '';
+  const max = Math.max(...pts, 1), w = 100, h = tall ? 60 : 40;
+  const d = pts.map((v, i) => `${(i / (pts.length - 1) * w).toFixed(2)},${(h - v / max * (h - 4) - 2).toFixed(2)}`)
+                .map((s, i) => (i ? 'L' : 'M') + s).join(' ');
+  return `<svg class="spark${tall ? ' tall' : ''}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="width:100%;height:${h}px;display:block;margin-top:4px">
+    <path d="${d}" fill="none" stroke="var(--accent)" stroke-width="1.2" vector-effect="non-scaling-stroke"/></svg>`;
+}
+
+/// 多线折线图，series = [{name, color, pts: [{x:ts, y:number}]}]
+/// 悬浮显示该时间戳上每条线的数值（由 attachChartTooltips 接管）。
+function multichart(series, opts) {
+  const W = 100, H = 110, P = 6;  // viewBox 坐标，CSS 拉伸
+  const all = series.flatMap(s => (s && Array.isArray(s.pts)) ? s.pts : []);
+  if (all.length < 2) return '';
+  const xs = all.map(p => +new Date(p.x));
+  const ys = all.map(p => p.y).filter(v => typeof v === 'number' && isFinite(v));
+  if (ys.length < 2) return '';
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  let yLo = Math.min(...ys), yHi = Math.max(...ys);
+  // 全 0 或单值时给个可视区间，避免线贴底看不出
+  if (yHi - yLo < (opts && opts.minSpan ? opts.minSpan : 1e-9)) {
+    const c = (yHi + yLo) / 2;
+    const half = (opts && opts.minSpan ? opts.minSpan : 1) / 2;
+    yLo = Math.max(0, c - half); yHi = c + half;
+  } else {
+    const pad = (yHi - yLo) * 0.1;
+    yLo = Math.max(0, yLo - pad); yHi += pad;
+  }
+  const xSpan = xMax - xMin || 1, ySpan = yHi - yLo || 1;
+  const xPos = t => P + (+new Date(t) - xMin) / xSpan * (W - 2 * P);
+  const yPos = v => H - P - (v - yLo) / ySpan * (H - 2 * P);
+
+  let paths = '';
+  for (const s of series) {
+    if (!s || !Array.isArray(s.pts)) continue;
+    const pts = s.pts.filter(p => p && typeof p.y === 'number' && isFinite(p.y));
+    if (pts.length < 2) continue;
+    const d = pts.map(p => `${xPos(p.x).toFixed(2)},${yPos(p.y).toFixed(2)}`)
+                 .map((seg, i) => (i ? 'L' : 'M') + seg).join(' ');
+    paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.2" vector-effect="non-scaling-stroke"/>`;
+  }
+  if (!paths) return '';
+
+  const id = 'mc' + Math.random().toString(36).slice(2, 8);
+  // 每个 series 的原始点存进 data，悬浮时按最近 x 对齐
+  const payload = series.map(s => ({ n: s.name, c: s.color, p: s.pts.map(p => [+new Date(p.x), p.y]) }));
+  // 不画坐标轴数值：数值走悬浮 tooltip
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"
+      data-chart-id="${id}" data-x-min="${xMin}" data-x-max="${xMax}"
+      data-y-lo="${yLo}" data-y-hi="${yHi}" data-series='${esc(JSON.stringify(payload))}'>
+    <line class="tip-line" x1="0" y1="${P}" x2="0" y2="${H - P}" stroke="var(--muted)" stroke-width="0.5" stroke-dasharray="2,2" style="display:none"/>
+    ${paths}
+    <circle class="tip-dot" r="1.6" fill="var(--accent)" style="display:none"/>
+  </svg>
+  <div class="tip" style="display:none"></div>
+  <div class="legend">${series.map(s => `<span class="lg"><span class="sw" style="background:${s.color}"></span>${esc(s.name)}</span>`).join('')}</div>`;
+}
+
+/// 流量汇总成一行：下载速率 / 上传速率 / 总累计
+function traffic(hist) {
+  if (!dashCfg.showTraffic || hist.length < 2) return '';
+  const a = hist[0], b = hist[hist.length - 1];
+  const dt = (new Date(b.ts) - new Date(a.ts)) / 1000;
+  if (dt <= 0) return '';
+  const rxs = Math.max(0, b.net_rx - a.net_rx) / dt, txs = Math.max(0, b.net_tx - a.net_tx) / dt;
+  const rxWindow = Math.max(0, b.net_rx - a.net_rx), txWindow = Math.max(0, b.net_tx - a.net_tx);
+  return `<span>↓<b class="v">${fmtBytes(rxs)}/s</b> ↑<b class="v">${fmtBytes(txs)}/s</b></span>
+          <span>累计 ↓<b class="v">${fmtBytes(rxWindow)}</b> ↑<b class="v">${fmtBytes(txWindow)}</b></span>
+          <span>总 ↓<b class="v">${fmtBytes(b.net_rx)}</b> ↑<b class="v">${fmtBytes(b.net_tx)}</b></span>`;
+}
+
+/// 从 history 抽每个探测目标的延迟 / 丢包序列
+/// 按"地址"分组（不是别名）：同一个目标在改别名前后是同一系列，别名优先作为显示名
+/// 丢包率按"范围内有丢包的采集次数 / 总采集次数"聚合（lossRatePct）
+function probeSeries(hist) {
+  const map = new Map();  // 地址 -> {name, latency, loss, lossCnt, totalCnt}
+  for (const h of hist) {
+    const list = (h.probes && h.probes.length) ? h.probes : (h.probe && h.probe.sent > 0 ? [h.probe] : []);
+    for (const p of list) {
+      if (!p.target) continue;
+      const [alias, addr] = p.target.includes('|') ? p.target.split('|', 2) : [null, p.target];
+      if (!map.has(addr)) map.set(addr, { addr, name: alias || addr, latency: [], loss: [], lossCnt: 0, totalCnt: 0 });
+      const rec = map.get(addr);
+      if (alias) rec.name = alias;  // 有别名就用别名（覆盖旧数据的裸地址名）
+      if (typeof p.latency_avg_ms === 'number') rec.latency.push({ x: h.ts, y: p.latency_avg_ms });
+      if (typeof p.loss_pct === 'number') {
+        rec.loss.push({ x: h.ts, y: p.loss_pct });
+        rec.totalCnt++;
+        if (p.loss_pct > 0) rec.lossCnt++;
+      }
+    }
+  }
+  for (const rec of map.values()) {
+    rec.lossRatePct = rec.totalCnt ? (rec.lossCnt / rec.totalCnt) * 100 : 0;
+  }
+  return Array.from(map.values());
+}
+
+function card(s, hist) {
+  const m = s.latest || {};
+  const cpu = m.cpu_usage ?? 0;
+
+  // 磁盘：保留两套——总览（用了多少/总共多少）+ 每挂载点明细
+  const disks = m.disks || [];
+  const diskUsedTotal = disks.reduce((a, d) => a + (d.used || 0), 0);
+  const diskCapTotal = disks.reduce((a, d) => a + (d.total || 0), 0);
+  // 三栏指标：CPU / 内存 / 磁盘用量
+  const cpuSub = m.load1 != null ? `load ${m.load1.toFixed(2)}` : `${m.cpu_cores || '?'}c`;
+  const memSub = `${fmtBytes(m.mem_used)} / ${fmtBytes(m.mem_total)}`;
+  // 磁盘详情开关：总览模式只显示聚合行，明细模式展开每挂载点
+  const diskDetail = !dashCfg.disksTotalOnly ? disks.map(d => {
+    const p = pct(d.used || 0, d.total || 1);
+    return `<div class="metric"><div class="lbl">磁盘 ${esc(d.mount || '')}</div>
+      <div class="val">${p.toFixed(1)}%</div>
+      <div class="sub">${fmtBytes(d.used)} / ${fmtBytes(d.total)}</div>
+      <div class="${barClass(p)}"><i style="width:${p.toFixed(1)}%"></i></div></div>`;
+  }).join('') : metric('磁盘', pct(diskUsedTotal, diskCapTotal).toFixed(1) + '%',
+                          `${fmtBytes(diskUsedTotal)} / ${fmtBytes(diskCapTotal)}`,
+                          diskUsedTotal, diskCapTotal);
+  const metrics = `
+    <div class="metrics ${dashCfg.disksTotalOnly ? '' : 'with-detail'}">
+      ${metric('CPU', cpu.toFixed(1) + '%', cpuSub, cpu, 100)}
+      ${metric('内存', fmtBytes(m.mem_used), memSub, m.mem_used, m.mem_total)}
+      ${diskDetail}
+    </div>`;
+
+  // 探针（紧凑行）：多目标时每个占一格（名+延迟+丢包），不挤成一行
+  // 丢包率 = 所选时间范围内「有丢包的采集次数 / 总采集次数」（不是最新一次的值）
+  const series = probeSeries(hist);
+  const probes = (m.probes && m.probes.length) ? m.probes : (m.probe && m.probe.sent > 0 ? [m.probe] : []);
+  let probeCells = '';
+  for (const p of probes) {
+    if (!p.target) continue;
+    const [alias, addr] = p.target.includes('|') ? p.target.split('|', 2) : [null, p.target];
+    const label = (alias && alias.trim()) || addr;
+    const delay = p.latency_avg_ms == null ? '-' : `${p.latency_avg_ms.toFixed(1)}ms`;
+    const sr = series.find(s => s.addr === addr);
+    const lossPct = sr ? sr.lossRatePct : 0;
+    probeCells += `<span class="pg-name" title="${esc(label)}">${esc(label)}</span>
+      <span class="pg-val">${delay} · ${lossPct.toFixed(1)}%</span>`;
+  }
+
+  // 图表区（默认折叠，点击"图表"按钮展开）；series 已在探针行算好
+  const probeColors = ['var(--accent)', 'var(--warn)', '#16a34a', '#dc2626', '#b388ff', '#0891b2', '#f59e0b', '#10b981'];
+  const latencySeries = series.map((s, i) => ({ name: s.name, color: probeColors[i % probeColors.length], pts: s.latency }));
+  const lossSeries = series.map((s, i) => ({ name: s.name, color: probeColors[i % probeColors.length], pts: s.loss }));
+  const isOpen = drawerOpen.has(s.id);
+  // 时间范围选择器放在图表区内（简写），切换立即重拉（全卡共用同一选择）
+  const picker = `<div class="section-h range-row"><span>范围</span>
+    <span class="range-pick">${RANGE_HOURS.map(h =>
+      `<button type="button" class="${h === viewHours ? 'act' : ''}" data-h="${h}">${h}</button>`).join('')}</span></div>`;
+  const drawer = `
+    <div class="drawer ${isOpen ? 'open' : ''}" id="dr-${esc(s.id)}">
+      ${picker}
+      ${dashCfg.showCpuChart ? `<div class="section-h"><span>CPU 使用率</span></div>${sparkline(hist, p => p.cpu_usage, true)}` : ''}
+      ${dashCfg.showLatencyChart && latencySeries.length ? `<div class="section-h"><span>延迟 (ms) · ${viewHours}h</span></div>${multichart(latencySeries)}` : ''}
+      ${dashCfg.showLossChart && lossSeries.length ? `<div class="section-h"><span>丢包率 (%) · ${viewHours}h</span></div>${multichart(lossSeries)}` : ''}
+    </div>`;
+
+  return `<div class="card ${isOpen ? 'has-open' : ''}">
+    <h2><span class="dot ${s.online ? 'on' : 'off'}"></span>${esc(s.name)}
+        <span class="spacer"></span>
+        <span class="pill">${s.online ? '在线' : '离线'}</span>
+        <button class="chart-btn" type="button" aria-expanded="${isOpen}"
+                onclick="toggleDrawer('${esc(s.id)}', this)">图表 ${isOpen ? '▴' : '▾'}</button></h2>
+    <div class="meta">${esc(s.os)} · ${esc(s.arch)} · ${esc(s.cpu_name)} ×${s.cpu_cores}</div>
+    ${metrics}
+    ${drawer}
+    <div class="foot">
+      <span>运行时长 <b class="v">${fmtUptime(m.uptime || 0)}</b></span>
+      <span>最后上报 <b class="v">${ago(s.last_seen)}</b></span>
+      ${traffic(hist)}
+    </div>
+    ${probeCells ? `<div class="foot" style="margin-top:2px; display:block"><div class="probe-grid">${probeCells}</div></div>` : ''}
+  </div>`;
+}
+
+/// 点击"图表"按钮：切换该服务器的图表区折叠状态（仅 JS 操作，不重渲染）
+/// 同时只允许一张图表展开：新打开自动收起其余；点击抽屉外区域也收起当前。
+function toggleDrawer(id, btn) {
+  const d = document.getElementById('dr-' + id);
+  if (!d) return;
+  const willOpen = !d.classList.contains('open');
+  // 单展开：收起所有其它卡片
+  if (willOpen) closeAllDrawers(id);
+  const open = d.classList.toggle('open', willOpen);
+  const card = d.parentElement;
+  card.classList.toggle('has-open', open);
+  if (open) drawerOpen.add(id); else drawerOpen.delete(id);
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  btn.textContent = open ? '图表 ▴' : '图表 ▾';
+  if (open) attachChartTooltips(d);
+}
+
+/// 收起所有展开的图表抽屉；exceptId 保留（用于"切到另一张"时免闪烁）。
+function closeAllDrawers(exceptId) {
+  for (const id of [...drawerOpen]) {
+    if (id === exceptId) continue;
+    const other = document.getElementById('dr-' + id);
+    if (!other) { drawerOpen.delete(id); continue; }
+    other.classList.remove('open');
+    other.parentElement.classList.remove('has-open');
+    drawerOpen.delete(id);
+    // 同步按钮文本与 aria
+    const card = other.parentElement;
+    const btn = card.querySelector('.chart-btn');
+    if (btn) {
+      btn.setAttribute('aria-expanded', 'false');
+      btn.textContent = '图表 ▾';
+    }
+  }
+}
+
+/// 多线图悬浮：找鼠标 x 最近的采样点，显示同一时间戳所有线的数值
+function attachChartTooltips(root) {
+  for (const svg of root.querySelectorAll('svg.chart')) {
+    const series = JSON.parse(svg.dataset.series || '[]');
+    const tip = svg.nextElementSibling;
+    if (!tip || !tip.classList.contains('tip')) continue;
+    const tipLine = svg.querySelector('.tip-line');
+    const tipDot = svg.querySelector('.tip-dot');
+    const W = 100, H = 110, P = 6;
+    const xMin = +svg.dataset.xMin, xMax = +svg.dataset.xMax;
+    const yLo = +svg.dataset.yLo, yHi = +svg.dataset.yHi;
+    const xSpan = (xMax - xMin) || 1, ySpan = (yHi - yLo) || 1;
+    // 把所有点按时间戳分组，悬浮时整组一起显示
+    const byTs = new Map();
+    for (const s of series) {
+      for (const [t, y] of s.p) {
+        if (typeof y !== 'number' || !isFinite(y)) continue;
+        if (!byTs.has(t)) byTs.set(t, []);
+        byTs.get(t).push({ name: s.n, color: s.c, y });
+      }
+    }
+    const stamps = [...byTs.keys()].sort((a, b) => a - b);
+    if (stamps.length < 2) continue;
+
+    const onMove = e => {
+      const r = svg.getBoundingClientRect();
+      const vx = (e.clientX - r.left) / r.width * W;          // 换算到 viewBox 坐标
+      const targetT = xMin + (vx - P) / (W - 2 * P) * xSpan;
+      // 二分找最近时间戳
+      let lo = 0, hi = stamps.length - 1;
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1;
+        if (stamps[mid] < targetT) lo = mid; else hi = mid;
+      }
+      const t = Math.abs(stamps[lo] - targetT) <= Math.abs(stamps[hi] - targetT) ? stamps[lo] : stamps[hi];
+      const vals = byTs.get(t);
+      const vxLine = P + (t - xMin) / xSpan * (W - 2 * P);
+      tipLine.setAttribute('x1', vxLine); tipLine.setAttribute('x2', vxLine);
+      tipLine.style.display = '';
+      // dot 落在最上面那条线（取第一个 series 在该时刻的值）
+      const first = vals[0];
+      tipDot.setAttribute('cx', vxLine);
+      tipDot.setAttribute('cy', H - P - (first.y - yLo) / ySpan * (H - 2 * P));
+      tipDot.setAttribute('fill', first.color);
+      tipDot.style.display = '';
+      tip.textContent = [`时间 ${fmtDate(t)}`]
+        .concat(vals.map(v => `${v.name}: ${v.y.toFixed(1)}`)).join('\n');
+      tip.style.display = '';
+      // tip 是 absolute，定位基准是最近 positioned 祖先（.card/.drawer），
+      // 不是传入的 root（可能是 #cards）；用 offsetParent 对齐 CSS 真实基准。
+      const rootRect = (tip.offsetParent || root).getBoundingClientRect();
+      let left = e.clientX - rootRect.left + 10;
+      if (left > rootRect.width - 130) left = e.clientX - rootRect.left - 130;
+      tip.style.left = Math.max(0, left) + 'px';
+      tip.style.top = Math.max(0, e.clientY - rootRect.top - 10) + 'px';
+    };
+    const onLeave = () => {
+      tipLine.style.display = 'none'; tipDot.style.display = 'none'; tip.style.display = 'none';
+    };
+    svg.addEventListener('mousemove', onMove);
+    svg.addEventListener('mouseleave', onLeave);
+    svg.addEventListener('touchmove', ev => { if (ev.touches[0]) onMove(ev.touches[0]); }, { passive: true });
+    svg.addEventListener('touchend', onLeave);
+  }
+}
+
+async function refresh() {
+  try {
+    const servers = await (await fetch('/api/servers')).json();
+    document.getElementById('summary').textContent =
+      `${servers.length} 台服务器 · ${servers.filter(s => s.online).length} 在线`;
+    if (!servers.length) {
+      document.getElementById('cards').innerHTML =
+        '<div class="empty">还没有 agent 上报。部署一个 agent 后会自动出现。</div>';
+      return;
+    }
+    // 按用户选的时间范围拉历史；10s 间隔。ponytail: 后端上限 9000 点
+    // （24h=8640 刚好在内），超出时报文/渲染会重，先直拉不降采样。
+    const n = Math.min(9000, Math.max(60, Math.ceil(viewHours * 3600 / 10)));
+    const hist = await Promise.all(servers.map(s =>
+      fetch(`/api/servers/${s.id}/history?n=${n}`).then(r => r.json()).catch(() => [])));
+    const cards = document.getElementById('cards');
+    cards.innerHTML = servers.map((s, i) => card(s, hist[i] || [])).join('');
+    attachChartTooltips(cards);
+  } catch (e) {
+    document.getElementById('summary').textContent = '加载失败: ' + e.message;
+  }
+}
+document.getElementById('clock').textContent = new Date().toLocaleString();
+// 范围选择器在每张卡的图表抽屉里（动态渲染），事件委托到 document
+document.addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-h]');
+  if (!b) return;
+  viewHours = Number(b.dataset.h);
+  localStorage.setItem('viewHours', viewHours);
+  refresh();  // 重渲染后按钮 act 状态由 card() 模板按 viewHours 生成
+});
+// 点击图表抽屉外（卡片其它区域或页面空白）收起当前展开的图表
+document.addEventListener('click', ev => {
+  if (ev.target.closest('.chart-btn')) return;        // 按钮自身走 toggleDrawer
+  if (ev.target.closest('.drawer')) return;           // 抽屉内部（含范围按钮）不收起
+  closeAllDrawers(null);
+});
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

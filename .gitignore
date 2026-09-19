@@ -1,0 +1,20 @@
+# 构建产物
+/target
+/dist
+**/*.rs.bk
+
+# 运行数据
+/data
+/data-test
+*.db
+*.db-shm
+*.db-wal
+
+# 密钥/环境
+.env
+.env.*
+!.env.example
+!.env.agent.example
+
+# 本地配置
+/.cargo/config.local.toml

@@ -1,0 +1,21 @@
+/* 深色极客 — 暗色终端风。等宽字体、霓虹绿、方角。 */
+:root {
+  --bg: #0b0f14;
+  --fg: #c9f7d4;
+  --muted: #5c7a66;
+  --card: #111820;
+  --border: #1f2d24;
+  --accent: #39ff14;
+  --ok: #39ff14;
+  --warn: #ffcc00;
+  --err: #ff3b30;
+  --radius: 2px;
+  --font: var(--mono);
+  --mono: "JetBrains Mono", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
+  --shadow: 0 0 0 1px var(--border), 0 0 18px rgba(57, 255, 20, 0.06);
+}
+body { letter-spacing: 0.02em; }
+h1, h2, h3 { text-transform: uppercase; letter-spacing: 0.12em; }
+.card, .panel { box-shadow: var(--shadow); }
+.pill { border-radius: var(--radius); }
+.nav a:hover, .nav a.active { text-shadow: 0 0 8px var(--accent); }

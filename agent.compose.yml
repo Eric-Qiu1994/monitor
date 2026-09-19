@@ -1,0 +1,31 @@
+# 远端 agent：每台被监控的主机一份，docker compose -f agent.compose.yml up -d
+# 通过 MONITOR_URL 指向中心 monitor，token 复制自中心 monitor 的 .env。
+#
+# 不需要 volumes / ports / network 联调，纯外向上报。
+services:
+  agent:
+    image: qjj223/monitor-agent:latest
+    container_name: monitor-agent
+    restart: unless-stopped
+    environment:
+      MONITOR_URL: ${MONITOR_URL:?请设置中心 monitor 地址，如 http://1.2.3.4:8080}
+      MONITOR_TOKEN: ${MONITOR_TOKEN:?请复制中心 monitor 的 MONITOR_TOKEN}
+      MONITOR_INTERVAL: ${MONITOR_INTERVAL:-10}
+      MONITOR_HOSTNAME: ${MONITOR_HOSTNAME:-}    # 留空则用容器主机名
+      MONITOR_PROXY: ${MONITOR_PROXY:-}         # 如需出网代理：socks5://host:1080
+      MONITOR_PING_METHOD: ${MONITOR_PING_METHOD:-icmp}
+      MONITOR_PING_COUNT: ${MONITOR_PING_COUNT:-3}
+      # 抵消宿主 ~/.docker/config.json proxies 段自动注入的 HTTP_PROXY：
+      # agent 上报走直连（要代理用上面的 MONITOR_PROXY）。
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    cap_add: ["NET_RAW"]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    # 如需 docker host 网络（更准的 cpu/网卡统计，但隔离差），加：
+    # network_mode: host
