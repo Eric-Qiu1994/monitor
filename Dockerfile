@@ -3,12 +3,16 @@
 # 下载被网络卡死，不在镜像里重复编）。
 FROM rust:1.98-bookworm AS builder
 WORKDIR /src
+# 走 rsproxy 镜像源（与宿主 ~/.cargo/config.toml 一致），避免直连 crates.io 慢
+RUN mkdir -p /usr/local/cargo && printf '[source.crates-io]\nreplace-with = "rsproxy"\n\n[source.rsproxy]\nregistry = "sparse+https://rsproxy.cn/index/"\n\n[net]\ngit-fetch-with-cli = true\n' > /usr/local/cargo/config.toml
 
 # 先复制清单，依赖层可复用；之后再复制源码。
 COPY Cargo.toml Cargo.lock ./
 COPY common/Cargo.toml common/Cargo.toml
 COPY monitor/Cargo.toml monitor/Cargo.toml
 COPY agent/Cargo.toml agent/Cargo.toml
+# registry 缓存挂载：清单变化导致层缓存失效时 crate 也不必重新下载
+RUN --mount=type=cache,target=/usr/local/cargo/registry cargo fetch
 COPY common/src common/src
 COPY monitor/src monitor/src
 COPY monitor/themes monitor/themes

@@ -1,5 +1,6 @@
 mod api;
 mod db;
+mod geo;
 mod host;
 mod notify;
 
@@ -119,9 +120,13 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(cli.listen)
         .await
         .with_context(|| format!("bind {}", cli.listen))?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // into_make_service_with_connect_info：/api/report 需要拿 agent 来源 IP 做地理定位
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     log::info!("已退出");
     Ok(())
 }
@@ -189,37 +194,80 @@ fn site_checker_loop(db: db::Db) {
     }
 }
 
-/// 离线通知循环：每 30s 检查一次刚离线的服务器。
+/// 离线通知循环：每 30s 检查一次状态翻转的服务器。
+/// 状态机：
+///   离线→在线：发一次恢复通知
+///   在线→离线：发一次离线通知
+/// ponytail: 状态全靠 HashSet 记忆，进程重启会把"已知离线"判为"刚离线"重发一次，可接受。
 fn offline_notify_loop(db: db::Db) {
-    let mut online_prev: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // true = 上次看到时在线，false = 上次看到时离线；不在集合内视为首次观察。
+    let mut prev_online: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     loop {
         std::thread::sleep(Duration::from_secs(30));
-        let (servers, cfg) = {
+        let cfg = {
             let conn = db.lock().unwrap();
-            let cfg = notify::load_config(&conn);
-            let servers = db::servers(&conn).unwrap_or_default();
-            (servers, cfg)
+            notify::load_config(&conn)
         };
-        if !cfg.offline_on || cfg.url.is_empty() {
+        if cfg.url.is_empty() {
             continue;
         }
+        let interval = {
+            let conn = db.lock().unwrap();
+            db::kv_get(&conn, "report_interval", "0").parse::<u64>().unwrap_or(0)
+        };
+        let servers = {
+            let conn = db.lock().unwrap();
+            db::servers(&conn).unwrap_or_default()
+        };
+        let now = chrono::Utc::now();
+        let now_str = db::now_str();
         for s in servers {
-            // 离线判定：与 api::is_online 同窗口（3 个上报周期 + 宽限，跟随后台配置）
-            let interval = {
-                let conn = db.lock().unwrap();
-                db::kv_get(&conn, "report_interval", "0").parse::<u64>().unwrap_or(0)
+            let last = chrono::DateTime::parse_from_rfc3339(&s.last_seen)
+                .ok()
+                .map(|t| t.with_timezone(&chrono::Utc));
+            // 每台单独设置的上报间隔优先；0 = 全局
+            let eff_interval = if s.report_interval > 0 { s.report_interval } else { interval };
+            let online = match last {
+                Some(t) => now.signed_duration_since(t)
+                    < chrono::Duration::seconds(api::online_window_secs(eff_interval)),
+                None => false,
             };
-            let online = match chrono::DateTime::parse_from_rfc3339(&s.last_seen) {
-                Ok(t) => chrono::Utc::now().signed_duration_since(t.with_timezone(&chrono::Utc))
-                    < chrono::Duration::seconds(api::online_window_secs(interval)),
-                Err(_) => false,
+            let prev = prev_online.get(&s.id).copied();
+            let node = if s.hostname.is_empty() || s.name == s.hostname {
+                s.name.clone()
+            } else {
+                format!("{} {}", s.name, s.hostname)
+            };
+            // 格式化 last_seen -> "YYYY-MM-DD HH:MM:SS"
+            let last_str = match last {
+                Some(t) => t.format("%Y-%m-%d %H:%M:%S").to_string(),
+                None => "未知".to_string(),
             };
             if online {
-                online_prev.insert(s.id.clone());
-            } else if online_prev.remove(&s.id) {
-                // 之前在线，现在离线 → 通知一次
-                let text = format!("服务器离线: {} ({})", s.name, s.hostname);
-                notify::send(&db, &cfg, "offline", &text);
+                if prev == Some(false) {
+                    // 离线 → 在线：发恢复通知
+                    if cfg.offline_on {
+                        let msg = format!("节点已恢复上报；最新上报 {last_str}");
+                        let text = notify::render_tpl(&cfg.recover_tpl, &node, &msg, &now_str);
+                        notify::send(&db, &cfg, "recover", &text);
+                    }
+                }
+                prev_online.insert(s.id.clone(), true);
+            } else {
+                if prev == Some(true) {
+                    // 在线 → 离线：发离线通知
+                    if cfg.offline_on {
+                        let offline_secs = match last {
+                            Some(t) => now.signed_duration_since(t).num_seconds().max(0),
+                            None => 0,
+                        };
+                        let mins = offline_secs / 60;
+                        let msg = format!("离线 {mins} 分钟；最后上报 {last_str}");
+                        let text = notify::render_tpl(&cfg.offline_tpl, &node, &msg, &now_str);
+                        notify::send(&db, &cfg, "offline", &text);
+                    }
+                }
+                prev_online.insert(s.id.clone(), false);
             }
         }
     }

@@ -16,7 +16,15 @@ pub struct NotifyConfig {
     pub offline_on: bool,
     /// 网站异常通知开关
     pub site_on: bool,
+    /// 离线推送模板
+    pub offline_tpl: String,
+    /// 恢复上线推送模板
+    pub recover_tpl: String,
 }
+
+/// 默认模板。占位符：{node} {msg} {time}。
+pub const DEFAULT_OFFLINE_TPL: &str = "事件: 离线告警\n节点: {node}\n消息: {msg}\n时间: {time}";
+pub const DEFAULT_RECOVER_TPL: &str = "事件: 恢复上线\n节点: {node}\n消息: {msg}\n时间: {time}";
 
 pub fn load_config(conn: &rusqlite::Connection) -> NotifyConfig {
     NotifyConfig {
@@ -25,6 +33,8 @@ pub fn load_config(conn: &rusqlite::Connection) -> NotifyConfig {
         secret: db::kv_get(conn, "notify_secret", ""),
         offline_on: db::kv_get(conn, "notify_offline_on", "1") == "1",
         site_on: db::kv_get(conn, "notify_site_on", "1") == "1",
+        offline_tpl: db::kv_get(conn, "notify_offline_tpl", DEFAULT_OFFLINE_TPL),
+        recover_tpl: db::kv_get(conn, "notify_recover_tpl", DEFAULT_RECOVER_TPL),
     }
 }
 
@@ -34,6 +44,13 @@ pub fn save_config(conn: &rusqlite::Connection, c: &NotifyConfig) {
     db::kv_set(conn, "notify_secret", &c.secret);
     db::kv_set(conn, "notify_offline_on", if c.offline_on { "1" } else { "0" });
     db::kv_set(conn, "notify_site_on", if c.site_on { "1" } else { "0" });
+    db::kv_set(conn, "notify_offline_tpl", &c.offline_tpl);
+    db::kv_set(conn, "notify_recover_tpl", &c.recover_tpl);
+}
+
+/// 用模板渲染通知文本。node = "别名 主机名"，msg/time 由调用方给出。
+pub fn render_tpl(tpl: &str, node: &str, msg: &str, time: &str) -> String {
+    tpl.replace("{node}", node).replace("{msg}", msg).replace("{time}", time)
 }
 
 /// HMAC-SHA256（基于 db::sha256_hex 手写实现的字节版需要重写，这里独立实现）。
@@ -130,11 +147,11 @@ fn build_payload(channel: &str, text: &str) -> serde_json::Value {
     match channel {
         "dingtalk" => serde_json::json!({
             "msgtype": "text",
-            "text": { "content": format!("【服务器探针】{text}") }
+            "text": { "content": text }
         }),
         "feishu" => serde_json::json!({
             "msg_type": "text",
-            "content": { "text": format!("【服务器探针】{text}") }
+            "content": { "text": text }
         }),
         _ => serde_json::json!({ "text": text, "content": text }),
     }
@@ -198,5 +215,17 @@ mod tests {
         assert_eq!(build_payload("dingtalk", "hi")["msgtype"], "text");
         assert_eq!(build_payload("feishu", "hi")["msg_type"], "text");
         assert_eq!(build_payload("generic", "hi")["text"], "hi");
+        // 推送正文不再附加【服务器探针】前缀（钉钉/飞书）
+        assert_eq!(build_payload("dingtalk", "hi")["text"]["content"], "hi");
+        assert_eq!(build_payload("feishu", "hi")["content"]["text"], "hi");
+    }
+
+    #[test]
+    fn render_tpl_substitutes_placeholders() {
+        let s = render_tpl(DEFAULT_OFFLINE_TPL, "isvoro HKL", "离线 10 分钟", "2026-09-19 23:56:54");
+        assert!(s.contains("事件: 离线告警"));
+        assert!(s.contains("节点: isvoro HKL"));
+        assert!(s.contains("消息: 离线 10 分钟"));
+        assert!(s.contains("时间: 2026-09-19 23:56:54"));
     }
 }

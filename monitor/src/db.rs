@@ -39,7 +39,7 @@ pub fn open(path: &Path) -> Result<Db> {
     Ok(Arc::new(Mutex::new(conn)))
 }
 
-fn migrate(conn: &Connection) -> Result<()> {
+pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS servers (
@@ -112,6 +112,14 @@ fn migrate(conn: &Connection) -> Result<()> {
             target      TEXT NOT NULL,
             method      TEXT NOT NULL DEFAULT 'icmp',
             enabled     INTEGER NOT NULL DEFAULT 1
+        );
+
+        -- 单台服务器的探测点排除表：默认无行 = 使用全部启用的探测点
+        -- 按 target 地址而非 id 存：备份恢复会重建 probe_targets 导致 id 漂移
+        CREATE TABLE IF NOT EXISTS probe_excludes (
+            server_id   TEXT NOT NULL,
+            target      TEXT NOT NULL,
+            PRIMARY KEY (server_id, target)
         );
 
         CREATE TABLE IF NOT EXISTS sites (
@@ -303,7 +311,7 @@ pub fn get_probe_config(conn: &Connection) -> Result<(String, String, u32)> {
             .optional()?
             .unwrap_or_else(|| d.into()))
     };
-    let target = kv("probe_target", "1.1.1.1")?;
+    let target = kv("probe_target", "")?;
     let method = kv("probe_method", "icmp")?;
     let count: u32 = kv("probe_count", "3")?.parse().unwrap_or(3);
     Ok((target, method, count.clamp(1, 10)))
@@ -391,6 +399,55 @@ fn probe_targets_impl(conn: &Connection, only_enabled: bool) -> Result<Vec<Probe
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(v)
+}
+
+// ---------- 单服务器探测点排除 ----------
+
+/// 某服务器被排除的探测点地址集合（按 target 地址，非 id）
+pub fn probe_excludes(conn: &Connection, server_id: &str) -> Result<std::collections::HashSet<String>> {
+    let mut st = conn.prepare("SELECT target FROM probe_excludes WHERE server_id=?1")?;
+    let v = st
+        .query_map(params![server_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    Ok(v)
+}
+
+/// 全量覆盖某服务器的排除集合（前端传最终应排除的 target 地址列表）
+pub fn set_probe_excludes(conn: &Connection, server_id: &str, targets: &[String]) -> Result<()> {
+    conn.execute("DELETE FROM probe_excludes WHERE server_id=?1", params![server_id])?;
+    let mut st = conn.prepare("INSERT OR IGNORE INTO probe_excludes (server_id, target) VALUES (?1, ?2)")?;
+    for t in targets {
+        st.execute(params![server_id, t])?;
+    }
+    Ok(())
+}
+
+/// agent 该用的启用探测点：全局启用列表减去该服务器排除的
+pub fn probe_targets_for_server(conn: &Connection, server_id: &str) -> Result<Vec<ProbeTargetRow>> {
+    let excl = probe_excludes(conn, server_id)?;
+    Ok(probe_targets_enabled(conn)?
+        .into_iter()
+        .filter(|t| !excl.contains(&t.target))
+        .collect())
+}
+
+/// 备份导出用：所有服务器的排除项
+pub fn all_probe_excludes(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut st = conn.prepare("SELECT server_id, target FROM probe_excludes")?;
+    let v = st
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(v)
+}
+
+/// 备份恢复用：全量替换排除表
+pub fn restore_probe_excludes(conn: &Connection, rows: &[(String, String)]) -> Result<()> {
+    conn.execute("DELETE FROM probe_excludes", [])?;
+    let mut st = conn.prepare("INSERT OR IGNORE INTO probe_excludes (server_id, target) VALUES (?1, ?2)")?;
+    for (sid, t) in rows {
+        st.execute(params![sid, t])?;
+    }
+    Ok(())
 }
 
 // ---------- 网站监控 ----------
@@ -513,6 +570,23 @@ fn migrate_metrics_probe_columns(conn: &Connection) -> Result<()> {
             "ALTER TABLE probe_targets ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
         )?;
     }
+    // servers.country：服务器所属国家（后台手选，国旗 emoji 前端显示）
+    let mut st3 = conn.prepare("PRAGMA table_info(servers)")?;
+    let snames = st3
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    drop(st3);
+    if !snames.contains("country") {
+        conn.execute_batch("ALTER TABLE servers ADD COLUMN country TEXT NOT NULL DEFAULT ''")?;
+    }
+    // servers.report_interval：每台上报间隔（秒），0 = 用系统设置全局值
+    // servers.fail_threshold：连续上报失败判离线次数，0 = 用全局默认
+    if !snames.contains("report_interval") {
+        conn.execute_batch("ALTER TABLE servers ADD COLUMN report_interval INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !snames.contains("fail_threshold") {
+        conn.execute_batch("ALTER TABLE servers ADD COLUMN fail_threshold INTEGER NOT NULL DEFAULT 0")?;
+    }
     Ok(())
 }
 
@@ -568,6 +642,14 @@ pub fn server_id_for(hostname: &str) -> String {
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     format!("{h:016x}")[..12].to_string()
+}
+
+pub fn set_server_country(conn: &Connection, id: &str, country: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE servers SET country=?2 WHERE id=?1",
+        params![id, country],
+    )?;
+    Ok(())
 }
 
 pub fn upsert_server(
@@ -653,12 +735,18 @@ pub struct ServerRow {
     pub cpu_name: String,
     pub cpu_cores: u32,
     pub note: String,
+    pub country: String,
     pub last_seen: String,
+    /// 每台上报间隔（秒），0 = 用系统设置全局值
+    pub report_interval: u64,
+    /// 连续上报失败判离线次数，0 = 用全局默认
+    pub fail_threshold: u64,
 }
 
 pub fn servers(conn: &Connection) -> Result<Vec<ServerRow>> {
     let mut st = conn.prepare(
-        "SELECT id, name, hostname, os, arch, kernel, cpu_name, cpu_cores, note, last_seen
+        "SELECT id, name, hostname, os, arch, kernel, cpu_name, cpu_cores, note, country, last_seen,
+                report_interval, fail_threshold
          FROM servers ORDER BY name",
     )?;
     let rows = st
@@ -673,12 +761,23 @@ pub fn servers(conn: &Connection) -> Result<Vec<ServerRow>> {
                 cpu_name: r.get(6)?,
                 cpu_cores: r.get(7)?,
                 note: r.get(8)?,
-                last_seen: r.get(9)?,
+                country: r.get(9)?,
+                last_seen: r.get(10)?,
+                report_interval: r.get::<_, i64>(11)?.max(0) as u64,
+                fail_threshold: r.get::<_, i64>(12)?.max(0) as u64,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(st);
     Ok(rows)
+}
+
+/// 更新单服务器上报间隔 / 失败阈值（0 = 回落全局默认）
+pub fn set_server_timing(conn: &Connection, id: &str, report_interval: u64, fail_threshold: u64) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE servers SET report_interval=?2, fail_threshold=?3 WHERE id=?1",
+        params![id, (report_interval.min(3600)) as i64, (fail_threshold.min(100)) as i64],
+    )? > 0)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -770,6 +869,7 @@ pub fn rename_server(conn: &Connection, id: &str, name: &str) -> Result<()> {
 
 pub fn delete_server(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM metrics WHERE server_id=?1", params![id])?;
+    conn.execute("DELETE FROM probe_excludes WHERE server_id=?1", params![id])?;
     conn.execute("DELETE FROM servers WHERE id=?1", params![id])?;
     Ok(())
 }
@@ -986,6 +1086,47 @@ mod tests {
     }
 
     #[test]
+    fn probe_targets_per_server_excludes() {
+        let db = mem_db();
+        let c = db.lock().unwrap();
+        add_probe_target(&c, "CF", "1.1.1.1", "icmp").unwrap();
+        add_probe_target(&c, "GG", "8.8.8.8", "icmp").unwrap();
+        // 服务器 A 排除 GG（按地址）
+        set_probe_excludes(&c, "srvA", &["8.8.8.8".into()]).unwrap();
+        let a = probe_targets_for_server(&c, "srvA").unwrap();
+        assert_eq!(a.len(), 1, "A 应只剩 CF");
+        assert_eq!(a[0].target, "1.1.1.1");
+        // 服务器 B 无排除行 = 全部（默认语义）
+        assert_eq!(probe_targets_for_server(&c, "srvB").unwrap().len(), 2, "B 默认拿到全部启用项");
+        // 清空排除 = 回到全部
+        set_probe_excludes(&c, "srvA", &[]).unwrap();
+        assert_eq!(probe_targets_for_server(&c, "srvA").unwrap().len(), 2);
+        // 排除一个不存在的地址不应出错，也不影响结果
+        set_probe_excludes(&c, "srvA", &["9.9.9.9".into()]).unwrap();
+        assert_eq!(probe_targets_for_server(&c, "srvA").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn server_timing_roundtrip_and_clamp() {
+        let db = mem_db();
+        let c = db.lock().unwrap();
+        // agent 上报一次，生成服务器行
+        let r = monitor_common::Report { hostname: "timing-test".into(), ..Default::default() };
+        let id = server_id_for("timing-test");
+        upsert_server(&c, &id, "timing-test", "linux", "x86_64", "k", "cpu", 1).unwrap();
+        assert!(!set_server_timing(&c, "nope", 60, 5).unwrap(), "不存在 id 应返回 false");
+        assert!(set_server_timing(&c, &id, 99999, 999).unwrap(), "clamp 后仍应更新成功");
+        let s = servers(&c).unwrap().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(s.report_interval, 3600, "间隔上限 3600");
+        assert_eq!(s.fail_threshold, 100, "阈值上限 100");
+        // 归零 = 回落全局
+        assert!(set_server_timing(&c, &id, 0, 0).unwrap());
+        let s = servers(&c).unwrap().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!((s.report_interval, s.fail_threshold), (0, 0));
+        let _ = r;
+    }
+
+    #[test]
     fn seeds_builtin_themes_and_active() {
         let db = mem_db();
         let c = db.lock().unwrap();
@@ -1032,7 +1173,8 @@ mod tests {
         let db = mem_db();
         let c = db.lock().unwrap();
         let (t, m, n) = get_probe_config(&c).unwrap();
-        assert_eq!((t.as_str(), m.as_str(), n), ("1.1.1.1", "icmp", 3));
+        // 默认不再带内置探测目标（1.1.1.1）；检测点由 probe_targets 表下发
+        assert_eq!((t.as_str(), m.as_str(), n), ("", "icmp", 3));
         set_probe_config(&c, "223.5.5.5", "tcp", 99).unwrap();
         let (t, m, n) = get_probe_config(&c).unwrap();
         assert_eq!((t.as_str(), m.as_str(), n), ("223.5.5.5", "tcp", 10));

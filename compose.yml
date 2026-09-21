@@ -12,8 +12,9 @@ services:
     image: qjj223/monitor:latest
     container_name: monitor
     restart: unless-stopped
-    ports:
-      - "${MONITOR_PORT:-8080}:8080"
+    # host 网络：保留 agent 真实来源 IP（IP 地理定位依赖）；MONITOR_PORT 需与容器内监听一致
+    # ponytail: 宿主 8080 被占时改 .env 的 MONITOR_PORT 并同步改这里，不能只改 .env
+    network_mode: host
     environment:
       MONITOR_TOKEN: ${MONITOR_TOKEN:?请先在 .env 设置 MONITOR_TOKEN}
       MONITOR_RETENTION_DAYS: ${MONITOR_RETENTION_DAYS:-7}

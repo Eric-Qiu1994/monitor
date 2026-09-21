@@ -30,8 +30,8 @@ struct Cli {
     #[arg(long, env = "MONITOR_PROXY")]
     proxy: Option<String>,
 
-    /// 默认 ICMP 探测目标（后台登录后可覆盖；留空关闭）
-    #[arg(long, env = "MONITOR_PING_TARGET", default_value = "1.1.1.1")]
+    /// 默认 ICMP 探测目标（后台登录后可覆盖；留空 = 不探测，检测点全部由后台下发）
+    #[arg(long, env = "MONITOR_PING_TARGET", default_value = "")]
     ping_target: String,
 
     /// 探测方式：icmp / http / tcp（后台可覆盖）
@@ -56,7 +56,13 @@ fn main() -> Result<()> {
         let local_cfg =
             collect::ProbeConfig::from_cli(&cli.ping_target, &cli.ping_method, cli.ping_count);
         let http = collect::build_agent(cli.proxy.as_deref())?;
-        let cfg = collect::fetch_probe_config(&http, &cli.url, cli.token.as_deref(), &local_cfg);
+        let cfg = collect::fetch_probe_config(
+            &http,
+            &cli.url,
+            cli.token.as_deref(),
+            &local_cfg,
+            collect::effective_hostname(cli.hostname.as_deref()).as_deref(),
+        );
         let r = collect::Collector::new(cli.hostname.as_deref())
             .sample_with_probe(&local_cfg, &cfg.targets)?;
         println!("{}", serde_json::to_string_pretty(&r)?);
@@ -82,7 +88,15 @@ fn main() -> Result<()> {
     let local_cfg =
         collect::ProbeConfig::from_cli(&cli.ping_target, &cli.ping_method, cli.ping_count);
     // 探测配置由后台下发；拉取失败用 CLI 本地配置兜底
-    let mut cfg = collect::fetch_probe_config(&agent, &cli.url, cli.token.as_deref(), &local_cfg);
+    // 带上有效 hostname，服务端据此套用该服务器的探测点排除表
+    let host = collect::effective_hostname(cli.hostname.as_deref());
+    let mut cfg = collect::fetch_probe_config(
+        &agent,
+        &cli.url,
+        cli.token.as_deref(),
+        &local_cfg,
+        host.as_deref(),
+    );
     // 上报间隔：后台 report_interval > 0 时用后台（覆盖 CLI），否则保留 CLI
     fn pick_interval(cli: u64, from_server: u64) -> u64 {
         if from_server > 0 { from_server.max(1) } else { cli.max(1) }
@@ -97,23 +111,65 @@ fn main() -> Result<()> {
             let nap = left.min(STEP);
             std::thread::sleep(Duration::from_secs(nap));
             left -= nap;
-            *cfg = collect::fetch_probe_config(&agent, &cli.url, cli.token.as_deref(), &local_cfg);
+            *cfg = collect::fetch_probe_config(
+                &agent,
+                &cli.url,
+                cli.token.as_deref(),
+                &local_cfg,
+                host.as_deref(),
+            );
             left = left.min(pick_interval(cli.interval, cfg.report_interval));
         }
     };
     loop {
-        match collector.sample_with_probe(&local_cfg, &cfg.targets) {
-            Ok(r) => {
-                let errs = r.sanity_errors();
-                if !errs.is_empty() {
-                    log::warn!("跳过本次上报，数据自检未通过: {errs:?}");
-                } else if let Err(e) = post(&agent, &endpoint, cli.token.as_deref(), &r) {
-                    log::warn!("上报失败: {e:#}");
-                } else {
-                    log::debug!("上报成功 cpu={:.1}%", r.cpu_usage);
+        // 单次上报：失败时按 fail_threshold × 10s 间隔快速重试；阈值内任意一次成功即落账。
+        let threshold = cfg.fail_threshold.max(1);
+        let mut attempt = 0u64;
+        loop {
+            match collector.sample_with_probe(&local_cfg, &cfg.targets) {
+                Ok(r) => {
+                    let errs = r.sanity_errors();
+                    if !errs.is_empty() {
+                        log::warn!("跳过本次上报，数据自检未通过: {errs:?}");
+                        attempt += 1;
+                    } else {
+                        match post(&agent, &endpoint, cli.token.as_deref(), &r) {
+                            Ok(()) => {
+                                log::debug!("上报成功 cpu={:.1}%", r.cpu_usage);
+                                break;
+                            }
+                            Err(e) => {
+                                attempt += 1;
+                                if attempt >= threshold {
+                                    log::warn!(
+                                        "上报连续失败 {attempt}/{threshold} 次（不计入离线统计），最后一次: {e:#}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= threshold {
+                        log::warn!("采集连续失败 {attempt}/{threshold} 次: {e:#}");
+                    }
                 }
             }
-            Err(e) => log::warn!("采集失败: {e:#}"),
+            // 失败后 10s 重试；阈值未满则继续尝试，满了则退出内层、睡整段
+            if attempt < threshold {
+                std::thread::sleep(Duration::from_secs(10));
+                // 期间允许后台配置变化（如阈值/间隔调小）
+                cfg = collect::fetch_probe_config(
+                    &agent,
+                    &cli.url,
+                    cli.token.as_deref(),
+                    &local_cfg,
+                    host.as_deref(),
+                );
+                continue;
+            }
+            break;
         }
         // 睡眠期间分段刷新后台配置，间隔改动最多滞后 STEP 秒生效
         sleep_interval(&mut cfg);

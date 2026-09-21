@@ -385,16 +385,26 @@ pub struct AgentProbeCfg {
     pub targets: Vec<ProbeTarget>,
     pub interval: u64,       // 探测间隔（秒），0 = 跟随上报间隔
     pub report_interval: u64, // 后台下发的上报间隔（秒），0 = 沿用 CLI 的 MONITOR_INTERVAL
+    pub fail_threshold: u64, // 连续上报失败判离线次数（默认 3，下发失败回落 3）
 }
 
 /// 拉取后台下发的探测配置；任何失败都回落到 CLI 本地配置。
+/// hostname 用于服务端套单台服务器的探测点排除表。
 pub fn fetch_probe_config(
     agent: &ureq::Agent,
     base_url: &str,
     token: Option<&str>,
     fallback: &ProbeConfig,
+    hostname: Option<&str>,
 ) -> AgentProbeCfg {
-    let url = format!("{}/api/agent-config", base_url.trim_end_matches('/'));
+    let url = match hostname.filter(|h| !h.trim().is_empty()) {
+        Some(h) => format!(
+            "{}/api/agent-config?hostname={}",
+            base_url.trim_end_matches('/'),
+            urlencode(h.trim())
+        ),
+        None => format!("{}/api/agent-config", base_url.trim_end_matches('/')),
+    };
     let mut req = agent.get(&url);
     if let Some(t) = token {
         req = req.header("x-token", t);
@@ -411,6 +421,7 @@ pub fn fetch_probe_config(
         },
         interval: 0,
         report_interval: 0,
+        fail_threshold: 3,
     };
     match req.call() {
         Ok(resp) => match resp.into_body().read_to_string() {
@@ -436,6 +447,7 @@ pub fn fetch_probe_config(
                                 }],
                                 interval: v["interval"].as_u64().unwrap_or(0),
                                 report_interval: v["report_interval"].as_u64().unwrap_or(0),
+                                fail_threshold: v["fail_threshold"].as_u64().unwrap_or(3).max(1),
                             };
                         }
                     }
@@ -443,6 +455,7 @@ pub fn fetch_probe_config(
                         targets,
                         interval: v["interval"].as_u64().unwrap_or(0),
                         report_interval: v["report_interval"].as_u64().unwrap_or(0),
+                        fail_threshold: v["fail_threshold"].as_u64().unwrap_or(3).max(1),
                     }
                 }
                 Err(e) => {
@@ -460,6 +473,31 @@ pub fn fetch_probe_config(
             fallback_cfg()
         }
     }
+}
+
+/// agent 上报用的有效主机名：CLI 覆盖优先，其次系统 hostname。
+/// 服务端按同一名字算 server_id 来套探测点排除表，两边必须一致。
+pub fn effective_hostname(cli_hostname: Option<&str>) -> Option<String> {
+    cli_hostname
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .or_else(sysinfo::System::host_name)
+}
+
+/// 最小的 query 值转义：保留 unreserved 字符，其余按 %XX 编码。
+/// ponytail: 不引 url crate，hostname 字符集很窄，够用。
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// 构造带可选代理的 HTTP agent

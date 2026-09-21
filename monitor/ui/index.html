@@ -8,8 +8,29 @@
 <style>
 /* 结构样式：所有主题共用，配色/字体/圆角由主题 CSS 变量决定 */
 * { box-sizing: border-box; }
+/* 背景层：后台可配图片/不透明度/模糊；JS 把 --card-glass 设为 frosted/liquid 时卡片玻璃化 */
+:root { --bg-image: none; --bg-opacity: 1; --bg-blur: 0px; --card-glass: none; }
+body::before { content: ''; position: fixed; inset: 0; z-index: -1;
+  background-image: var(--bg-image); background-size: cover; background-position: center;
+  opacity: var(--bg-opacity); filter: blur(var(--bg-blur)); pointer-events: none; }
 body { margin: 0; padding: 24px; background: var(--bg); color: var(--fg);
        font-family: var(--font); font-size: 14px; line-height: 1.5; }
+/* 毛玻璃：半透明卡片 + 背景透出 */
+:root { --card-alpha: 1; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; }
+:root[data-glass="frosted"] .card {
+  background: color-mix(in srgb, var(--card) 55%, transparent);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+}
+/* 液态玻璃：更强模糊 + 高光边缘 + 内阴影 */
+:root[data-glass="liquid"] .card {
+  background: color-mix(in srgb, var(--card) 38%, transparent);
+  backdrop-filter: blur(22px) saturate(1.6); -webkit-backdrop-filter: blur(22px) saturate(1.6);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.28), inset 0 -1px 0 rgba(255,255,255,.08), var(--shadow);
+  border-color: rgba(255,255,255,.22);
+}
+.flag { font-size: 15px; line-height: 1; }
+.flags { font-size: 15px; letter-spacing: 2px; }
 a { color: var(--accent); text-decoration: none; }
 .top { display: flex; align-items: baseline; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
 h1 { font-size: 18px; margin: 0; font-weight: 600; }
@@ -92,6 +113,7 @@ td.v { text-align: right; font-family: var(--mono); }
 <div class="top">
   <h1 id="siteTitle">服务器探针</h1>
   <span class="muted" id="summary">加载中…</span>
+  <span class="flags" id="regionFlags" title="在线服务器所在地区"></span>
   <span class="spacer"></span>
   <span class="muted" id="clock"></span>
   <a href="/admin" id="adminLink">管理后台 →</a>
@@ -132,6 +154,8 @@ fetch('/api/public/dash-config').then(r => r.json()).then(c => {
   const link = document.getElementById('adminLink');
   if (dashCfg.showAdminLink === false) link.style.display = 'none';
   else link.href = dashCfg.adminPath || '/admin';
+  // 背景设置：图片/不透明度/模糊（作用于 body 伪背景层），玻璃效果作用于卡片
+  applyBackground();
   // 标题：H1 与 <title> 分别可配
   const st = dashCfg.siteTitle || '服务器探针';
   document.getElementById('siteTitle').textContent = st;
@@ -175,7 +199,8 @@ function multichart(series, opts) {
   const xs = all.map(p => +new Date(p.x));
   const ys = all.map(p => p.y).filter(v => typeof v === 'number' && isFinite(v));
   if (ys.length < 2) return '';
-  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const xMin = (opts && opts.xMin != null) ? +opts.xMin : Math.min(...xs);
+  const xMax = (opts && opts.xMax != null) ? +opts.xMax : Math.max(...xs);
   let yLo = Math.min(...ys), yHi = Math.max(...ys);
   // 全 0 或单值时给个可视区间，避免线贴底看不出
   if (yHi - yLo < (opts && opts.minSpan ? opts.minSpan : 1e-9)) {
@@ -216,7 +241,7 @@ function multichart(series, opts) {
   <div class="legend">${series.map(s => `<span class="lg"><span class="sw" style="background:${s.color}"></span>${esc(s.name)}</span>`).join('')}</div>`;
 }
 
-/// 流量汇总成一行：下载速率 / 上传速率 / 总累计
+/// 流量汇总成一行：下载速率 / 上传速率 / 区间累计 / 总累计（各子开关独立控制）
 function traffic(hist) {
   if (!dashCfg.showTraffic || hist.length < 2) return '';
   const a = hist[0], b = hist[hist.length - 1];
@@ -224,16 +249,27 @@ function traffic(hist) {
   if (dt <= 0) return '';
   const rxs = Math.max(0, b.net_rx - a.net_rx) / dt, txs = Math.max(0, b.net_tx - a.net_tx) / dt;
   const rxWindow = Math.max(0, b.net_rx - a.net_rx), txWindow = Math.max(0, b.net_tx - a.net_tx);
-  return `<span>↓<b class="v">${fmtBytes(rxs)}/s</b> ↑<b class="v">${fmtBytes(txs)}/s</b></span>
-          <span>累计 ↓<b class="v">${fmtBytes(rxWindow)}</b> ↑<b class="v">${fmtBytes(txWindow)}</b></span>
-          <span>总 ↓<b class="v">${fmtBytes(b.net_rx)}</b> ↑<b class="v">${fmtBytes(b.net_tx)}</b></span>`;
+  // 子开关缺省 true（老配置没有这些键时保持原样显示）
+  const c = k => dashCfg[k] !== false;
+  return [
+    c('showRate') ? `<span>↓<b class="v">${fmtBytes(rxs)}/s</b> ↑<b class="v">${fmtBytes(txs)}/s</b></span>` : '',
+    c('showWindowTotal') ? `<span>累计 ↓<b class="v">${fmtBytes(rxWindow)}</b> ↑<b class="v">${fmtBytes(txWindow)}</b></span>` : '',
+    c('showTrafficTotal') ? `<span>总 ↓<b class="v">${fmtBytes(b.net_rx)}</b> ↑<b class="v">${fmtBytes(b.net_tx)}</b></span>` : ''
+  ].filter(Boolean).join('');
 }
 
 /// 从 history 抽每个探测目标的延迟 / 丢包序列
 /// 按"地址"分组（不是别名）：同一个目标在改别名前后是同一系列，别名优先作为显示名
 /// 丢包率按"范围内有丢包的采集次数 / 总采集次数"聚合（lossRatePct）
+/// ponytail: 卡片均值窗口独立配置，但图表窗口 = viewHours（仪表盘共用选择）
 function probeSeries(hist) {
   const map = new Map();  // 地址 -> {name, latency, loss, lossCnt, totalCnt}
+  // 卡片均值窗口独立配置：延迟/丢包各自按后台设置时长裁剪（时间倒推 cutoff）
+  const now = Date.now();
+  const latCut = now - (dashCfg.avgLatencyHours || 8) * 3600e3;
+  const lossCut = now - (dashCfg.avgLossHours || 8) * 3600e3;
+  // 图表窗口 = 用户选定的 viewHours（仪表盘 1/4/8/12/24 选项卡）
+  const chartCut = now - viewHours * 3600e3;
   for (const h of hist) {
     const list = (h.probes && h.probes.length) ? h.probes : (h.probe && h.probe.sent > 0 ? [h.probe] : []);
     for (const p of list) {
@@ -242,21 +278,47 @@ function probeSeries(hist) {
       if (!map.has(addr)) map.set(addr, { addr, name: alias || addr, latency: [], loss: [], lossCnt: 0, totalCnt: 0 });
       const rec = map.get(addr);
       if (alias) rec.name = alias;  // 有别名就用别名（覆盖旧数据的裸地址名）
-      if (typeof p.latency_avg_ms === 'number') rec.latency.push({ x: h.ts, y: p.latency_avg_ms });
-      if (typeof p.loss_pct === 'number') {
+      const t0 = new Date(h.ts).getTime();
+      if (t0 >= chartCut && typeof p.latency_avg_ms === 'number') {
+        rec.latency.push({ x: h.ts, y: p.latency_avg_ms });
+      }
+      if (t0 >= chartCut && typeof p.loss_pct === 'number') {
         rec.loss.push({ x: h.ts, y: p.loss_pct });
-        rec.totalCnt++;
         if (p.loss_pct > 0) rec.lossCnt++;
+        rec.totalCnt++;
       }
     }
   }
   for (const rec of map.values()) {
-    rec.lossRatePct = rec.totalCnt ? (rec.lossCnt / rec.totalCnt) * 100 : 0;
+    // 卡片数字按后台配置时长独立裁剪
+    const t0 = t => new Date(t).getTime();
+    const lat = rec.latency.filter(p => t0(p.x) >= latCut);
+    const loss = rec.loss.filter(p => t0(p.x) >= lossCut);
+    const lossCnt = loss.filter(p => p.y > 0).length;
+    rec.lossRatePct = loss.length ? (lossCnt / loss.length) * 100 : 0;
     // 窗口内平均延迟：卡片展示用（区别于最新一次采集的单轮 ping 均值）
-    rec.avgLatency = rec.latency.length
-      ? rec.latency.reduce((a, p) => a + p.y, 0) / rec.latency.length : null;
+    rec.avgLatency = lat.length
+      ? lat.reduce((a, p) => a + p.y, 0) / lat.length : null;
   }
   return Array.from(map.values());
+}
+
+/// 应用背景设置（bgImage/bgOpacity/bgBlur/bgGlass）
+function applyBackground() {
+  const r = document.documentElement.style;
+  const img = dashCfg.bgImage || '';
+  const op = dashCfg.bgOpacity ?? 100, bl = dashCfg.bgBlur || 0, glass = dashCfg.bgGlass || 'none';
+  r.setProperty('--bg-image', img ? `url("${img.replace(/"/g, '%22')}")` : 'none');
+  r.setProperty('--bg-opacity', op / 100);
+  r.setProperty('--bg-blur', bl + 'px');
+  const g = glass === 'frosted' || glass === 'liquid' ? glass : 'none';
+  document.documentElement.dataset.glass = g;
+}
+
+/// ISO alpha-2 -> 国旗 emoji
+function flagOf(code) {
+  if (!/^[A-Za-z]{2}$/.test(code || '')) return '';
+  return String.fromCodePoint(...[...code.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65));
 }
 
 function card(s, hist) {
@@ -318,13 +380,14 @@ function card(s, hist) {
     <div class="drawer ${isOpen ? 'open' : ''}" id="dr-${esc(s.id)}">
       ${picker}
       ${dashCfg.showCpuChart ? `<div class="section-h"><span>CPU 使用率</span></div>${sparkline(hist, p => p.cpu_usage, true)}` : ''}
-      ${dashCfg.showLatencyChart && latencySeries.length ? `<div class="section-h"><span>延迟 (ms) · ${viewHours}h</span></div>${multichart(latencySeries)}` : ''}
-      ${dashCfg.showLossChart && lossSeries.length ? `<div class="section-h"><span>丢包率 (%) · ${viewHours}h</span></div>${multichart(lossSeries)}` : ''}
+      ${dashCfg.showLatencyChart && latencySeries.length ? `<div class="section-h"><span>延迟 (ms) · ${viewHours}h</span></div>${multichart(latencySeries, { xMin: Date.now() - viewHours * 3600e3, xMax: Date.now() })}` : ''}
+      ${dashCfg.showLossChart && lossSeries.length ? `<div class="section-h"><span>丢包率 (%) · ${viewHours}h</span></div>${multichart(lossSeries, { xMin: Date.now() - viewHours * 3600e3, xMax: Date.now() })}` : ''}
     </div>`;
 
   return `<div class="card ${isOpen ? 'has-open' : ''}">
     <h2><span class="dot ${s.online ? 'on' : 'off'}"></span>${esc(s.name)}
         <span class="spacer"></span>
+        ${s.country && dashCfg.showFlags !== false ? `<span class="flag" title="${esc(s.country)}">${flagOf(s.country)}</span>` : ''}
         <span class="pill">${s.online ? '在线' : '离线'}</span>
         <button class="chart-btn" type="button" aria-expanded="${isOpen}"
                 onclick="toggleDrawer('${esc(s.id)}', this)">图表 ${isOpen ? '▴' : '▾'}</button></h2>
@@ -332,8 +395,8 @@ function card(s, hist) {
     ${metrics}
     ${drawer}
     <div class="foot">
-      <span>运行时长 <b class="v">${fmtUptime(m.uptime || 0)}</b></span>
-      <span>最后上报 <b class="v">${ago(s.last_seen)}</b></span>
+      ${dashCfg.showUptime !== false ? `<span>运行时长 <b class="v">${fmtUptime(m.uptime || 0)}</b></span>` : ''}
+      ${dashCfg.showLastSeen !== false ? `<span>最后上报 <b class="v">${ago(s.last_seen)}</b></span>` : ''}
       ${traffic(hist)}
     </div>
     ${probeCells ? `<div class="foot" style="margin-top:2px; display:block"><div class="probe-grid">${probeCells}</div></div>` : ''}
@@ -445,16 +508,23 @@ function attachChartTooltips(root) {
 async function refresh() {
   try {
     const servers = await (await fetch('/api/servers')).json();
+    const online = servers.filter(s => s.online);
+    // 点亮地区 = 在线且定位到国家的去重数量；国旗跟随显示（开关在后台设置）
+    const showRegions = dashCfg.showRegions !== false;
+    const showFlags = dashCfg.showFlags !== false;
+    const regions = showRegions ? [...new Set(online.filter(s => s.country).map(s => s.country))] : [];
     document.getElementById('summary').textContent =
-      `${servers.length} 台服务器 · ${servers.filter(s => s.online).length} 在线`;
+      `${servers.length} 台服务器 · ${online.length} 在线${showRegions ? ` · ${regions.length} 地区点亮` : ''}`;
+    document.getElementById('regionFlags').textContent = showRegions && showFlags ? regions.map(flagOf).join(' ') : '';
     if (!servers.length) {
       document.getElementById('cards').innerHTML =
         '<div class="empty">还没有 agent 上报。部署一个 agent 后会自动出现。</div>';
       return;
     }
-    // 按用户选的时间范围拉历史；10s 间隔。ponytail: 后端上限 9000 点
-    // （24h=8640 刚好在内），超出时报文/渲染会重，先直拉不降采样。
-    const n = Math.min(9000, Math.max(60, Math.ceil(viewHours * 3600 / 10)));
+    // 拉取量需同时覆盖：查看范围 viewHours + 卡片均值配置时长（avgLatencyHours/avgLossHours）
+    // ponytail: 上限 9000 点（24h@10s=8640），超配时均值窗口自动被截短
+    const maxH = Math.max(viewHours, dashCfg.avgLatencyHours || 8, dashCfg.avgLossHours || 8);
+    const n = Math.min(9000, Math.max(60, Math.ceil(maxH * 3600 / 10)));
     const hist = await Promise.all(servers.map(s =>
       fetch(`/api/servers/${s.id}/history?n=${n}`).then(r => r.json()).catch(() => [])));
     const cards = document.getElementById('cards');

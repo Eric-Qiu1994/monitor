@@ -43,19 +43,53 @@ ul.list .nm { font-weight: 600; }
 .msg { margin-top: 10px; font-size: 12px; min-height: 18px; }
 .msg.ok { color: var(--ok); } .msg.err { color: var(--err); }
 .cols { display: grid; gap: 16px; grid-template-columns: 1fr 1fr; }
-@media (max-width: 900px) { body { flex-direction: column; } aside { width: 100%; flex-direction: row; flex-wrap: wrap; }
-  aside h1 { width: 100%; } .cols { grid-template-columns: 1fr; } }
-#login { max-width: 380px; margin: 10vh auto; }
+#navToggle { display: none; position: fixed; top: 10px; left: 10px; z-index: 40;
+  width: 36px; height: 36px; padding: 0; font-size: 18px; line-height: 1;
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); }
+#navToggle.hidden { display: none; }
+@media (max-width: 900px) {
+  body { flex-direction: column; }
+  aside { position: fixed; inset: 0 auto 0 0; width: 200px; z-index: 50;
+          transform: translateX(-100%); transition: transform .2s ease; box-shadow: 2px 0 12px rgba(0,0,0,.25); }
+  aside.open { transform: translateX(0); }
+  aside h1 { width: auto; } .cols { grid-template-columns: 1fr; }
+  #navToggle { display: block; }
+  main { padding: 16px; padding-top: 52px; } }
+#navMask { display: none; position: fixed; inset: 0; z-index: 45; background: rgba(0,0,0,.35); }
+/* 登录页：全屏渐变底 + 居中卡片 */
+#loginWrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+  padding: 20px; background:
+    radial-gradient(1200px 600px at 70% -10%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 55%),
+    var(--bg); }
+#login { max-width: 380px; width: 100%; margin: 0; position: static; transform: none;
+  box-shadow: 0 10px 40px rgba(0,0,0,.18); animation: loginIn .35s ease; }
+@keyframes loginIn { from { opacity: 0; transform: translateY(12px); } }
+#login h3 { display: flex; align-items: center; gap: 10px; margin-top: 0; }
+#login h3::before { content: ''; width: 10px; height: 10px; border-radius: 50%;
+  background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 25%, transparent); }
+#login .btns button { width: 100%; padding: 10px; font-size: 14px; }
+#login input:focus { border-color: var(--accent); }
+#loginWrap.hidden { display: none; }  /* ID 特异性压过 #loginWrap 的 flex */
 .hidden { display: none; }
 .page { display: none; } .page.active { display: block; }
 .checkline { display: flex; align-items: center; gap: 8px; margin: 10px 0; font-size: 13px; }
 .checkline input[type=checkbox] { width: auto; }
+.subtabs { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
+.subtab { background: transparent; color: var(--muted); border: 0; border-bottom: 2px solid transparent;
+         padding: 7px 14px; cursor: pointer; font-size: 13px; border-radius: 0; font-weight: 500; }
+.subtab:hover { color: var(--fg); }
+.subtab.active { color: var(--fg); border-bottom-color: var(--accent); }
+.subpage { display: none; } .subpage.active { display: block; }
+dialog { background: var(--card); color: inherit; border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; min-width: 320px; }
+dialog::backdrop { background: rgba(0,0,0,.45); }
 </style>
 </head>
 <body>
 
 <!-- 登录 -->
-<div id="login" class="card" style="position:absolute;top:20vh;left:50%;transform:translateX(-50%)">
+<div id="loginWrap">
+<div id="login" class="card">
   <h3>后台登录</h3>
   <label for="lu">用户名</label>
   <input id="lu" type="text" value="admin" autocomplete="username">
@@ -65,8 +99,11 @@ ul.list .nm { font-weight: 600; }
   <div id="loginMsg" class="msg"></div>
   <div class="muted">默认账号 admin / admin，登录后请立即修改。</div>
 </div>
+</div>
 
 <!-- 登录后的管理区 -->
+<button id="navToggle" class="hidden" onclick="toggleNav()" aria-label="菜单">☰</button>
+<div id="navMask" onclick="toggleNav(false)"></div>
 <aside id="panel" class="hidden">
   <h1>后台管理</h1>
   <button class="nav active" data-page="servers">服务器</button>
@@ -94,6 +131,18 @@ ul.list .nm { font-weight: 600; }
       <div class="msg" id="srvMsg"></div>
     </div>
   </div>
+
+  <!-- 单台服务器探测点（默认全选，取消勾选即排除） -->
+  <dialog id="probeDlg">
+    <h3 id="probeDlgTitle">探测点</h3>
+    <p class="muted" style="margin-top:0">取消勾选即对该服务器停用该检测点（默认全部启用）</p>
+    <div id="probeDlgList"></div>
+    <div class="btns" style="margin-top:14px">
+      <button onclick="saveProbeExcludes()">保存</button>
+      <button class="ghost" onclick="document.getElementById('probeDlg').close()">取消</button>
+    </div>
+    <div class="msg" id="probeDlgMsg"></div>
+  </dialog>
 
   <!-- 网站 -->
   <div class="page" id="page-sites">
@@ -124,7 +173,14 @@ ul.list .nm { font-weight: 600; }
     <div class="card">
       <h3>仪表盘显示</h3>
       <div class="checkline"><input id="setDiskTotal" type="checkbox"><span>硬盘只显示总大小（不显示每挂载点明细）</span></div>
-      <div class="checkline"><input id="setTraffic" type="checkbox"><span>显示流量统计（区间累计 + 总累计）</span></div>
+      <div class="checkline"><input id="setTraffic" type="checkbox" onchange="toggleTrafficSub()"><span>显示流量统计</span></div>
+      <div id="trafficSub">
+        <div class="checkline" style="margin-left:20px"><input id="setRate" type="checkbox" checked><span>流量速率（↓/↑ xx/s）</span></div>
+        <div class="checkline" style="margin-left:20px"><input id="setWindowTotal" type="checkbox" checked><span>区间累计流量</span></div>
+        <div class="checkline" style="margin-left:20px"><input id="setTrafficTotal" type="checkbox" checked><span>流量总计（自 agent 启动）</span></div>
+      </div>
+      <div class="checkline"><input id="setUptime" type="checkbox" checked><span>显示运行时长</span></div>
+      <div class="checkline"><input id="setLastSeen" type="checkbox" checked><span>显示最后上报时间</span></div>
       <div class="checkline"><input id="setLatencyChart" type="checkbox"><span>显示延迟图表</span></div>
       <div class="checkline"><input id="setLossChart" type="checkbox"><span>显示丢包率图表</span></div>
       <div class="checkline"><input id="setCpuChart" type="checkbox"><span>显示 CPU 使用率图表</span></div>
@@ -143,6 +199,52 @@ ul.list .nm { font-weight: 600; }
             <option value="12">12</option><option value="24">24</option>
           </select>
         </div>
+        <div>
+          <label for="setAvgLatencyH">卡片平均延迟时长（小时）</label>
+          <select id="setAvgLatencyH">
+            <option value="1">1</option><option value="4">4</option><option value="8">8</option>
+            <option value="12">12</option><option value="24">24</option>
+          </select>
+        </div>
+        <div>
+          <label for="setAvgLossH">卡片平均丢包时长（小时）</label>
+          <select id="setAvgLossH">
+            <option value="1">1</option><option value="4">4</option><option value="8">8</option>
+            <option value="12">12</option><option value="24">24</option>
+          </select>
+        </div>
+      </div>
+      <div style="display:flex;gap:24px;flex-wrap:wrap;margin-top:12px">
+        <div>
+          <label for="setBgOpacity">背景不透明度（%）</label>
+          <select id="setBgOpacity">
+            <option value="100">100</option><option value="80">80</option><option value="60">60</option>
+            <option value="40">40</option><option value="20">20</option><option value="10">10</option>
+          </select>
+        </div>
+        <div>
+          <label for="setBgBlur">背景模糊（px）</label>
+          <select id="setBgBlur">
+            <option value="0">0</option><option value="2">2</option><option value="4">4</option>
+            <option value="8">8</option><option value="12">12</option><option value="20">20</option>
+          </select>
+        </div>
+        <div>
+          <label for="setBgGlass">卡片玻璃效果</label>
+          <select id="setBgGlass">
+            <option value="none">无</option>
+            <option value="frosted">毛玻璃</option>
+            <option value="liquid">液态玻璃</option>
+          </select>
+        </div>
+      </div>
+      <div style="margin-top:12px">
+        <label for="setBgImage">背景图片 URL（https://，留空使用主题默认背景）</label>
+        <input id="setBgImage" type="text" maxlength="512" placeholder="https://example.com/bg.jpg">
+      </div>
+      <div style="display:flex;gap:24px;margin-top:12px">
+        <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="setShowRegions"> 显示地区点亮统计</label>
+        <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="setShowFlags"> 显示国旗</label>
       </div>
     </div>
     <div class="card">
@@ -158,6 +260,8 @@ ul.list .nm { font-weight: 600; }
         <option value="120">2 分钟</option>
         <option value="300">5 分钟</option>
       </select>
+      <label for="setFailThreshold">连续上报失败判离线次数（1–100，agent 重试间隔固定 10 秒）</label>
+      <input id="setFailThreshold" type="number" min="1" max="100" value="3">
       <div class="btns">
         <button onclick="saveSettings()">保存设置</button>
         <button class="ghost" onclick="clearMetrics()">清空全部采集数据</button>
@@ -182,25 +286,50 @@ _，默认 admin，即 /admin；保存后生效，需重启服务或重新进入
   <!-- 通知设置 -->
   <div class="page" id="page-notify">
     <h2 class="ptitle">通知设置</h2>
-    <div class="card">
-      <h3>Webhook 通知</h3>
-      <label for="nChannel">通知渠道</label>
-      <select id="nChannel">
-        <option value="generic">通用 Webhook（POST JSON）</option>
-        <option value="dingtalk">钉钉机器人</option>
-        <option value="feishu">飞书机器人</option>
-      </select>
-      <label for="nUrl">Webhook URL</label>
-      <input id="nUrl" type="url" placeholder="https://oapi.dingtalk.com/robot/send?access_token=...">
-      <label for="nSecret">加签密钥（钉钉/飞书，留空不加签）</label>
-      <input id="nSecret" type="text" placeholder="SEC...">
-      <div class="checkline"><input id="nOffline" type="checkbox" checked><span>服务器离线通知</span></div>
-      <div class="checkline"><input id="nSite" type="checkbox" checked><span>网站异常通知</span></div>
-      <div class="btns">
-        <button onclick="saveNotify()">保存通知设置</button>
-        <button class="ghost" onclick="testNotify()">发送测试通知</button>
+    <div class="subtabs">
+      <button class="subtab active" data-sub="notify-push">推送设置</button>
+      <button class="subtab" data-sub="notify-tpl">推送模板</button>
+    </div>
+
+    <!-- 子页：推送设置 -->
+    <div class="subpage active" id="sub-notify-push">
+      <div class="card">
+        <h3>Webhook 通知</h3>
+        <label for="nChannel">通知渠道</label>
+        <select id="nChannel">
+          <option value="generic">通用 Webhook（POST JSON）</option>
+          <option value="dingtalk">钉钉机器人</option>
+          <option value="feishu">飞书机器人</option>
+        </select>
+        <label for="nUrl">Webhook URL</label>
+        <input id="nUrl" type="url" placeholder="https://oapi.dingtalk.com/robot/send?access_token=...">
+        <label for="nSecret">加签密钥（钉钉/飞书，留空不加签）</label>
+        <input id="nSecret" type="text" placeholder="SEC...">
+        <div class="checkline"><input id="nOffline" type="checkbox" checked><span>服务器离线/恢复通知</span></div>
+        <div class="checkline"><input id="nSite" type="checkbox" checked><span>网站异常通知</span></div>
+        <div class="btns">
+          <button onclick="saveNotify()">保存通知设置</button>
+          <button class="ghost" onclick="testNotify()">发送测试通知</button>
+        </div>
+        <div class="msg" id="notifyMsg"></div>
       </div>
-      <div class="msg" id="notifyMsg"></div>
+    </div>
+
+    <!-- 子页：推送模板 -->
+    <div class="subpage" id="sub-notify-tpl">
+      <div class="card">
+        <h3>推送模板</h3>
+        <p class="muted">支持占位符 <code>{node}</code> 节点（别名 主机名）、<code>{msg}</code> 消息、<code>{time}</code> 时间。留空使用默认。</p>
+        <label for="nOfflineTpl">离线通知模板</label>
+        <textarea id="nOfflineTpl" rows="6"></textarea>
+        <label for="nRecoverTpl">恢复上线通知模板</label>
+        <textarea id="nRecoverTpl" rows="6"></textarea>
+        <div class="btns">
+          <button onclick="saveNotifyTpl()">保存模板</button>
+          <button class="ghost" onclick="resetNotifyTpl()">恢复默认</button>
+        </div>
+        <div class="msg" id="tplMsg"></div>
+      </div>
     </div>
   </div>
 
@@ -365,24 +494,46 @@ async function login() {
 async function logout() {
   try { await api('POST', '/api/admin/logout'); } catch (_) {}
   sessionStorage.removeItem('monitor_session'); session = '';
-  $('panel').classList.add('hidden'); $('panelMain').classList.add('hidden'); $('login').classList.remove('hidden');
+  $('panel').classList.add('hidden'); $('panelMain').classList.add('hidden');
+  $('loginWrap').classList.remove('hidden'); $('login').classList.remove('hidden');
+  toggleNav(false); $('navToggle').classList.add('hidden');
 }
 function enter() {
-  $('login').classList.add('hidden');
-  $('panel').classList.remove('hidden'); $('panelMain').classList.remove('hidden');
+  $('loginWrap').classList.add('hidden'); $('login').classList.add('hidden');
+  $('panel').classList.remove('hidden'); $('panelMain').classList.remove('hidden'); $('navToggle').classList.remove('hidden');
   loadServers(); loadProbeTargets(); loadSettings(); loadNotify(); loadThemes();
 }
 
 // ---------- 选项卡 ----------
+// 移动端抽屉侧边栏：点击横杠开、选完菜单/点遮罩关
+function toggleNav(open) {
+  const a = $('panel'), on = open ?? !a.classList.contains('open');
+  a.classList.toggle('open', on);
+  $('navMask').style.display = on ? 'block' : 'none';
+}
 document.querySelectorAll('button.nav').forEach(b => b.addEventListener('click', () => {
   document.querySelectorAll('button.nav').forEach(x => x.classList.remove('active'));
   b.classList.add('active');
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   $('page-' + b.dataset.page).classList.add('active');
+  toggleNav(false);
   const loaders = { servers: loadServers, sites: loadSites, probe: loadProbeTargets,
                     notify: loadNotify, themes: loadThemes, system: loadSettings };
   if (loaders[b.dataset.page]) loaders[b.dataset.page]();
 }));
+
+// 子选项卡切换（通知设置内嵌）
+document.addEventListener('click', (e) => {
+  const t = e.target.closest('.subtab');
+  if (!t) return;
+  const page = t.closest('.page');
+  if (!page) return;
+  page.querySelectorAll('.subtab').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  page.querySelectorAll('.subpage').forEach(p => p.classList.remove('active'));
+  const sub = page.querySelector('#sub-' + t.dataset.sub);
+  if (sub) sub.classList.add('active');
+});
 
 // ---------- 服务器 ----------
 async function loadServers() {
@@ -397,7 +548,10 @@ async function loadServers() {
         <span class="pill">${s.online ? '在线' : '离线'}</span>
         <span class="muted">磁盘 ${(diskTotal / 1073741824).toFixed(0)} GB</span>
         <span class="spacer" style="flex:1"></span>
+        <span class="muted">${s.country ? flagEmoji(s.country) : ''}</span>
         <button class="ghost" onclick="renameServer('${s.id}', '${esc(s.name)}')">改别名</button>
+        <button class="ghost" onclick="openProbeDlg('${s.id}', '${esc(s.name)}')">检测点</button>
+        <button class="ghost" onclick="setTiming('${s.id}', ${s.report_interval || 0}, ${s.fail_threshold || 0})">上报设置</button>
         <button class="ghost" onclick="delServer('${s.id}', '${esc(s.name)}')">删除数据</button>
       </li>`;
     }).join('') || '<li class="muted">暂无服务器</li>';
@@ -406,6 +560,44 @@ async function loadServers() {
     say('srvMsg', '读取失败: ' + e.message, 'err');
   }
 }
+// 单服务器探测点：默认全部启用，取消勾选 = 排除
+let probeDlgServer = null;
+async function openProbeDlg(id, name) {
+  probeDlgServer = id;
+  $('probeDlgTitle').textContent = `探测点 — ${name}`;
+  try {
+    const [targets, excl] = await Promise.all([
+      api('GET', '/api/admin/probe-targets'),
+      api('GET', `/api/admin/servers/${id}/probe-excludes`),
+    ]);
+    const excluded = new Set(excl.excludes || []);
+    if (!targets.length) {
+      $('probeDlgList').innerHTML = '<p class="muted">尚未配置任何探测点（先在「检测点」页添加）</p>';
+    } else {
+      // 按 target 地址标识：id 在备份恢复后会漂移，地址稳定
+      $('probeDlgList').innerHTML = targets.map(t => `
+        <div class="checkline"><input type="checkbox" data-target="${esc(t.target)}" ${excluded.has(t.target) ? '' : 'checked'}>
+        <span>${esc(t.name)} <span class="muted">${esc(t.target)} · ${esc(t.method)}</span></span></div>`).join('');
+    }
+    say('probeDlgMsg', '');
+    $('probeDlg').showModal();
+  } catch (e) {
+    say('srvMsg', '读取失败: ' + e.message, 'err');
+  }
+}
+async function saveProbeExcludes() {
+  // 收集未勾选的 = 排除集合
+  const excludes = [...document.querySelectorAll('#probeDlgList input[data-target]:not(:checked)')]
+    .map(i => i.dataset.target);
+  try {
+    await api('PUT', `/api/admin/servers/${probeDlgServer}/probe-excludes`, { excludes });
+    $('probeDlg').close();
+    say('srvMsg', '已保存；agent 下轮拉取生效（最多滞后一个上报间隔）', 'ok');
+  } catch (e) {
+    say('probeDlgMsg', '保存失败: ' + e.message, 'err');
+  }
+}
+
 async function renameServer(id, cur) {
   const name = prompt('新的服务器别名（1–64 字）', cur);
   if (name == null) return;
@@ -413,6 +605,25 @@ async function renameServer(id, cur) {
   if (!t) return;
   try { await api('PUT', `/api/servers/${id}`, { name: t }); say('srvMsg', '已改名', 'ok'); loadServers(); }
   catch (e) { say('srvMsg', '失败: ' + e.message, 'err'); }
+}
+// 单服务器上报间隔 / 失败阈值（0 = 用系统设置全局值）
+async function setTiming(id, curInterval, curThreshold) {
+  const ri = prompt('上报间隔秒（0 = 用系统设置全局值，最大 3600）', String(curInterval));
+  if (ri == null) return;
+  const ft = prompt('连续上报失败判离线次数（0 = 用系统设置全局值，最大 100）', String(curThreshold));
+  if (ft == null) return;
+  try {
+    await api('PUT', `/api/admin/servers/${id}/timing`, {
+      report_interval: Math.max(0, Math.min(3600, Number(ri) || 0)),
+      fail_threshold: Math.max(0, Math.min(100, Number(ft) || 0)),
+    });
+    say('srvMsg', '已保存；agent 下轮拉取生效（最多滞后一个上报间隔）', 'ok'); loadServers();
+  } catch (e) { say('srvMsg', '失败: ' + e.message, 'err'); }
+}
+// ISO alpha-2 -> 国旗 emoji（regional indicator 码位）
+function flagEmoji(code) {
+  if (!/^[A-Za-z]{2}$/.test(code)) return '';
+  return String.fromCodePoint(...[...code.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65));
 }
 async function delServer(id, name) {
   if (!confirm(`删除服务器「${name}」及其全部历史数据？此操作不可恢复。`)) return;
@@ -471,18 +682,36 @@ async function delSite(id, name) {
 }
 
 // ---------- 系统设置 ----------
+function toggleTrafficSub() {
+  $('trafficSub').style.display = $('setTraffic').checked ? '' : 'none';
+}
 async function loadSettings() {
   try {
     const s = await api('GET', '/api/admin/settings');
     $('setDiskTotal').checked = s.dash_disks_total_only;
     $('setTraffic').checked = s.dash_show_traffic;
+    toggleTrafficSub();
+    $('setRate').checked = s.dash_show_rate !== false;
+    $('setWindowTotal').checked = s.dash_show_window_total !== false;
+    $('setTrafficTotal').checked = s.dash_show_traffic_total !== false;
+    $('setUptime').checked = s.dash_show_uptime !== false;
+    $('setLastSeen').checked = s.dash_show_last_seen !== false;
     $('setLatencyChart').checked = s.dash_show_latency_chart;
     $('setLossChart').checked = s.dash_show_loss_chart;
     $('setCpuChart').checked = s.dash_show_cpu_chart;
     $('setRetention').value = s.retention_days;
     $('setReportInterval').value = String(s.report_interval || 0);
+    $('setFailThreshold').value = String(s.fail_threshold || 3);
     $('setProbeHours').value = String(s.dash_probe_hours || 8);
     $('setLossHours').value = String(s.dash_loss_hours || 8);
+    $('setAvgLatencyH').value = String(s.dash_avg_latency_hours || 8);
+    $('setAvgLossH').value = String(s.dash_avg_loss_hours || 8);
+    $('setBgImage').value = s.dash_bg_image || '';
+    $('setBgOpacity').value = String(s.dash_bg_opacity ?? 100);
+    $('setBgBlur').value = String(s.dash_bg_blur || 0);
+    $('setBgGlass').value = s.dash_bg_glass || 'none';
+    $('setShowRegions').checked = s.dash_show_regions !== false && s.dash_show_regions !== '0';
+    $('setShowFlags').checked = s.dash_show_flags !== false && s.dash_show_flags !== '0';
     $('setAdminPath').value = s.admin_path || 'admin';
     $('setAdminLink').checked = s.dash_show_admin_link !== false;
     $('setSiteTitle').value = s.site_title || '服务器探针';
@@ -496,13 +725,27 @@ async function saveSettings() {
     await api('PUT', '/api/admin/settings', {
       dash_disks_total_only: $('setDiskTotal').checked,
       dash_show_traffic: $('setTraffic').checked,
+      dash_show_rate: $('setRate').checked,
+      dash_show_window_total: $('setWindowTotal').checked,
+      dash_show_traffic_total: $('setTrafficTotal').checked,
+      dash_show_uptime: $('setUptime').checked,
+      dash_show_last_seen: $('setLastSeen').checked,
       dash_show_latency_chart: $('setLatencyChart').checked,
       dash_show_loss_chart: $('setLossChart').checked,
       dash_show_cpu_chart: $('setCpuChart').checked,
       retention_days: Number($('setRetention').value),
       report_interval: Number($('setReportInterval').value),
+      fail_threshold: Number($('setFailThreshold').value) || 3,
       dash_probe_hours: Number($('setProbeHours').value),
-      dash_loss_hours: Number($('setLossHours').value)
+      dash_loss_hours: Number($('setLossHours').value),
+      dash_avg_latency_hours: Number($('setAvgLatencyH').value),
+      dash_avg_loss_hours: Number($('setAvgLossH').value),
+      dash_bg_image: $('setBgImage').value.trim(),
+      dash_bg_opacity: Number($('setBgOpacity').value),
+      dash_bg_blur: Number($('setBgBlur').value),
+      dash_bg_glass: $('setBgGlass').value,
+      dash_show_regions: $('setShowRegions').checked,
+      dash_show_flags: $('setShowFlags').checked
     });
     say('setMsg', '已保存', 'ok');
   } catch (e) { say('setMsg', '失败: ' + e.message, 'err'); }
@@ -571,6 +814,8 @@ async function loadNotify() {
     const c = await api('GET', '/api/admin/notify');
     $('nChannel').value = c.channel; $('nUrl').value = c.url; $('nSecret').value = c.secret;
     $('nOffline').checked = c.offline_on; $('nSite').checked = c.site_on;
+    $('nOfflineTpl').value = c.offline_tpl;
+    $('nRecoverTpl').value = c.recover_tpl;
   } catch (e) {
     if (String(e.message).startsWith('401')) return logout();
     say('notifyMsg', '读取失败: ' + e.message, 'err');
@@ -584,6 +829,30 @@ async function saveNotify() {
     });
     say('notifyMsg', '已保存', 'ok');
   } catch (e) { say('notifyMsg', '失败: ' + e.message, 'err'); }
+}
+async function saveNotifyTpl() {
+  try {
+    await api('PUT', '/api/admin/notify', {
+      channel: $('nChannel').value, url: $('nUrl').value.trim(),
+      secret: $('nSecret').value.trim(), offline_on: $('nOffline').checked, site_on: $('nSite').checked,
+      offline_tpl: $('nOfflineTpl').value,
+      recover_tpl: $('nRecoverTpl').value,
+    });
+    say('tplMsg', '已保存', 'ok');
+  } catch (e) { say('tplMsg', '失败: ' + e.message, 'err'); }
+}
+async function resetNotifyTpl() {
+  try {
+    await api('PUT', '/api/admin/notify', {
+      channel: $('nChannel').value, url: $('nUrl').value.trim(),
+      secret: $('nSecret').value.trim(), offline_on: $('nOffline').checked, site_on: $('nSite').checked,
+      offline_tpl: 'reset', recover_tpl: 'reset',
+    });
+    const c = await api('GET', '/api/admin/notify');
+    $('nOfflineTpl').value = c.offline_tpl;
+    $('nRecoverTpl').value = c.recover_tpl;
+    say('tplMsg', '已恢复默认', 'ok');
+  } catch (e) { say('tplMsg', '失败: ' + e.message, 'err'); }
 }
 async function testNotify() {
   try {

@@ -7,7 +7,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use monitor_common::Report;
+use monitor_common::{NetworkProbe, Report};
 use rusqlite::params;
 use serde::Deserialize;
 use serde_json::json;
@@ -40,6 +40,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/servers/{id}/history", get(get_history))
         .route("/api/servers/{id}", put(rename_server))
         .route("/api/servers/{id}", delete(remove_server))
+        // 单服务器探测点排除（在 admin 侧写入，放这是为了 URL 语义）
+        .route(
+            "/api/admin/servers/{id}/probe-excludes",
+            get(get_server_probe_excludes).put(set_server_probe_excludes),
+        )
+        // 单服务器上报间隔 / 失败阈值（0 = 用系统设置全局值）
+        .route(
+            "/api/admin/servers/{id}/timing",
+            put(set_server_timing),
+        )
         // 主题
         .route("/api/themes", get(list_themes))
         .route("/api/themes", post(create_theme))
@@ -305,24 +315,58 @@ async fn admin_set_probe(
     }
 }
 
+#[derive(Deserialize, Default)]
+struct AgentConfigQuery {
+    /// agent 主机名；给了就按该服务器的排除表过滤探测点
+    #[serde(default)]
+    hostname: String,
+}
+
 /// agent 每轮拉取探测配置；token 校验（未设 token 则放行）。
 /// probe_targets 表为空时回落到旧单目标 kv 配置。
-async fn agent_config(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+/// 默认下发全部启用探测点；某服务器在 probe_excludes 里排除了的会被跳过。
+async fn agent_config(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<AgentConfigQuery>,
+) -> Response {
     if let Err(e) = authorize(&st, &headers) {
         return e;
     }
     let conn = st.db.lock().unwrap();
-    // 只下发启用的目标；禁用的留在后台列表里可随时改回来
-    let targets = db::probe_targets_enabled(&conn).unwrap_or_default();
+    let targets = if q.hostname.trim().is_empty() {
+        // 旧 agent 不带 hostname：拿到全部启用项（等同于默认全选）
+        db::probe_targets_enabled(&conn).unwrap_or_default()
+    } else {
+        db::probe_targets_for_server(&conn, &db::server_id_for(q.hostname.trim()))
+            .unwrap_or_default()
+    };
+    // 全局默认值（系统设置）
+    let global_interval: u64 = db::kv_get(&conn, "report_interval", "0")
+        .parse().unwrap_or(0).clamp(0, 3600);
+    let global_threshold: u64 = db::kv_get(&conn, "fail_threshold", "3")
+        .parse().unwrap_or(3).clamp(1, 100);
+    // 按服务器覆盖（需 hostname 匹配到已存在的服务器行）
+    let (report_interval, fail_threshold) = if q.hostname.trim().is_empty() {
+        (global_interval, global_threshold)
+    } else {
+        let sid = db::server_id_for(q.hostname.trim());
+        match db::servers(&conn).ok().and_then(|v| v.into_iter().find(|s| s.id == sid)) {
+            Some(s) => (
+                if s.report_interval > 0 { s.report_interval.min(3600) } else { global_interval },
+                if s.fail_threshold > 0 { s.fail_threshold.min(100) } else { global_threshold },
+            ),
+            None => (global_interval, global_threshold),
+        }
+    };
     match db::get_probe_config(&conn) {
         Ok((target, method, count)) => {
             let _ = (target, method);
-            let report_interval: u64 = db::kv_get(&conn, "report_interval", "0")
-                .parse().unwrap_or(0).clamp(0, 3600);
             Json(json!({
                 "targets": targets,
                 "count": count,
                 "report_interval": report_interval,
+                "fail_threshold": fail_threshold,
             }))
             .into_response()
         }
@@ -338,6 +382,7 @@ async fn agent_config(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
 async fn report(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
+    connect: axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(r): Json<Report>,
 ) -> Response {
     if let Err(e) = authorize(&st, &headers) {
@@ -357,6 +402,12 @@ async fn report(
     }
 
     let id = db::server_id_for(&r.hostname);
+    // IP 地理定位：查 agent 来源 IP 的国家码（缓存 + 失败静默），阻塞 HTTP 放 blocking 线程
+    let ip = connect.0.ip().to_string();
+    let country = tokio::task::spawn_blocking(move || crate::geo::lookup_country(&ip))
+        .await
+        .ok()
+        .flatten();
     let conn = st.db.lock().unwrap();
     let res = (|| -> anyhow::Result<()> {
         db::upsert_server(
@@ -369,6 +420,9 @@ async fn report(
             &r.cpu_name,
             r.cpu_cores,
         )?;
+        if let Some(cc) = &country {
+            db::set_server_country(&conn, &id, cc)?;
+        }
         db::insert_metric(&conn, &r, &id)?;
         Ok(())
     })();
@@ -387,24 +441,27 @@ async fn list_servers(State(st): State<Arc<AppState>>) -> Response {
     let conn = st.db.lock().unwrap();
     match db::servers(&conn) {
         Ok(rows) => {
-            // 附带最新一条采样，前端一张表就够用
-            let out: Vec<_> = rows
-                .iter()
-                .map(|s| {
-                    let latest = db::history(&conn, &s.id, 1).ok().and_then(|mut v| v.pop());
-                    let interval = db::kv_get(&conn, "report_interval", "0")
-                        .parse::<u64>()
-                        .unwrap_or(0);
-                    let online = is_online(&s.last_seen, interval);
-                    json!({
-                        "id": s.id, "name": s.name, "hostname": s.hostname,
-                        "os": s.os, "arch": s.arch, "kernel": s.kernel,
-                        "cpu_name": s.cpu_name, "cpu_cores": s.cpu_cores,
-                        "note": s.note, "last_seen": s.last_seen, "online": online,
-                        "latest": latest,
-                    })
+            let interval = db::kv_get(&conn, "report_interval", "0")
+                .parse::<u64>().unwrap_or(0);
+            // 附带最新一条采样，前端一张表就够用；按各服务器的探测点排除过滤探针
+            let out: Vec<_> = rows.iter().map(|s| {
+                let mut latest = db::history(&conn, &s.id, 1).ok().and_then(|mut v| v.pop());
+                if let Some(ref mut row) = latest {
+                    filter_excluded_probes(&conn, &s.id, &mut row.probes);
+                }
+                // 每台单独设置的上报间隔优先；0 = 全局
+                let eff_interval = if s.report_interval > 0 { s.report_interval } else { interval };
+                let online = is_online(&s.last_seen, eff_interval);
+                json!({
+                    "id": s.id, "name": s.name, "hostname": s.hostname,
+                    "os": s.os, "arch": s.arch, "kernel": s.kernel,
+                    "cpu_name": s.cpu_name, "cpu_cores": s.cpu_cores,
+                    "note": s.note, "last_seen": s.last_seen, "online": online,
+                    "country": s.country,
+                    "report_interval": s.report_interval, "fail_threshold": s.fail_threshold,
+                    "latest": latest,
                 })
-                .collect();
+            }).collect();
             Json(out).into_response()
         }
         Err(e) => {
@@ -414,13 +471,25 @@ async fn list_servers(State(st): State<Arc<AppState>>) -> Response {
     }
 }
 
+/// 从 MetricRow.probes 里剔除本服务器被排除的探测目标。
+/// addr 从 "name|addr" 取后半段，否则用整个 target；空表 = 不过滤。
+fn filter_excluded_probes(conn: &rusqlite::Connection, server_id: &str, probes: &mut Vec<NetworkProbe>) {
+    let excl = match db::probe_excludes(conn, server_id) {
+        Ok(s) if !s.is_empty() => s,
+        _ => return,
+    };
+    probes.retain(|p| {
+        let addr = p.target.split_once('|').map(|(_, a)| a).unwrap_or(&p.target);
+        !excl.contains(addr)
+    });
+}
+
 /// 超过 3 个上报周期没动静算离线；窗口跟随后台配置的 report_interval
-/// （默认 10s 时为 35s；设 5 分钟则放宽到 15 分钟）
-/// 另加 10 分钟宽限：后台把间隔从大改小时，旧 agent 的长睡眠还没醒，
-/// 立即按新窗口判定会误报离线。上线普遍后可收紧。
-/// ponytail: 固定宽限覆盖不了 >10 分钟的间隔调小；那时改 per-server interval 下发
+/// （默认 10s 时为 30s；设 5 分钟则放宽到 15 分钟；下限 35s 防 interval=0 误判）
+/// ponytail: 取消了原 600 秒宽限（旧理由是「间隔从大改小时旧 agent 还没醒」，
+/// 现在后台统一下发 report_interval 后不再需要）。
 pub fn online_window_secs(report_interval: u64) -> i64 {
-    (report_interval.max(1) as i64 * 3).max(35) + 600
+    (report_interval.max(1) as i64 * 3).max(35)
 }
 
 fn is_online(last_seen: &str, report_interval: u64) -> bool {
@@ -468,7 +537,15 @@ async fn get_history(
         return (StatusCode::NOT_FOUND, "no such server").into_response();
     }
     match db::history(&conn, &id, q.n.clamp(1, 9000)) {
-        Ok(v) => Json(v).into_response(),
+        Ok(mut v) => {
+                        let excl = db::probe_excludes(&conn, &id).unwrap_or_default();
+                        if !excl.is_empty() {
+                            for row in v.iter_mut() {
+                                filter_excluded_probes(&conn, &id, &mut row.probes);
+                            }
+                        }
+                        Json(v).into_response()
+                    }
         Err(e) => {
             log::error!("{e:#}");
             (StatusCode::INTERNAL_SERVER_ERROR, "query failed").into_response()
@@ -479,6 +556,9 @@ async fn get_history(
 #[derive(Deserialize)]
 struct RenameBody {
     name: String,
+    /// 可选：ISO 3166-1 alpha-2 国家码（空串清除）；改别名时不同时传就保持不变
+    #[serde(default)]
+    country: Option<String>,
 }
 async fn rename_server(
     State(st): State<Arc<AppState>>,
@@ -494,13 +574,22 @@ async fn rename_server(
         return (StatusCode::BAD_REQUEST, "name must be 1..=64 chars").into_response();
     }
     let conn = st.db.lock().unwrap();
-    match db::rename_server(&conn, &id, name) {
-        Ok(()) => (StatusCode::OK, "ok").into_response(),
-        Err(e) => {
+    if let Err(e) = db::rename_server(&conn, &id, name) {
+        log::error!("{e:#}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "update failed").into_response();
+    }
+    if let Some(c) = &b.country {
+        let c = c.trim().to_uppercase();
+        // 仅允许两位字母或空（清除）；国旗 emoji 由前端从码位生成
+        if !c.is_empty() && !(c.len() == 2 && c.chars().all(|ch| ch.is_ascii_alphabetic())) {
+            return (StatusCode::BAD_REQUEST, "country must be ISO alpha-2 or empty").into_response();
+        }
+        if let Err(e) = db::set_server_country(&conn, &id, &c) {
             log::error!("{e:#}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "update failed").into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, "update failed").into_response();
         }
     }
+    (StatusCode::OK, "ok").into_response()
 }
 
 async fn remove_server(
@@ -676,14 +765,19 @@ async fn set_active_theme(
 async fn theme_css(State(st): State<Arc<AppState>>) -> Response {
     let conn = st.db.lock().unwrap();
     let name = db::active_theme_name(&conn).unwrap_or_else(|_| "极简白".into());
-    match db::theme_by_name(&conn, &name) {
-        Ok(Some(t)) => ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], t.css).into_response(),
-        _ => (
-            [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-            ":root{}".to_string(),
-        )
-            .into_response(),
-    }
+    let body = match db::theme_by_name(&conn, &name) {
+        Ok(Some(t)) => t.css,
+        _ => ":root{}".to_string(),
+    };
+    // 切主题后仪表盘要立即变：禁用浏览器缓存
+    (
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// 仪表盘公开显示配置（无需鉴权，仅开关与小时数）
@@ -692,6 +786,12 @@ async fn dash_config(State(st): State<Arc<AppState>>) -> Response {
     Json(json!({
         "disksTotalOnly": db::kv_get(&conn, "dash_disks_total_only", "1") == "1",
         "showTraffic": db::kv_get(&conn, "dash_show_traffic", "1") == "1",
+        // 流量三个子开关（仅总开关 showTraffic 打开时才生效）
+        "showRate": db::kv_get(&conn, "dash_show_rate", "1") == "1",
+        "showWindowTotal": db::kv_get(&conn, "dash_show_window_total", "1") == "1",
+        "showTrafficTotal": db::kv_get(&conn, "dash_show_traffic_total", "1") == "1",
+        "showUptime": db::kv_get(&conn, "dash_show_uptime", "1") == "1",
+        "showLastSeen": db::kv_get(&conn, "dash_show_last_seen", "1") == "1",
         "probeHours": db::kv_get(&conn, "dash_probe_hours", "8").parse::<u32>().unwrap_or(8).clamp(1, 72),
         "lossHours": db::kv_get(&conn, "dash_loss_hours", "8").parse::<u32>().unwrap_or(8).clamp(1, 72),
         "showLatencyChart": db::kv_get(&conn, "dash_show_latency_chart", "1") == "1",
@@ -701,6 +801,15 @@ async fn dash_config(State(st): State<Arc<AppState>>) -> Response {
         "showAdminLink": db::kv_get(&conn, "dash_show_admin_link", "1") == "1",
         "siteTitle": db::kv_get(&conn, "site_title", "服务器探针"),
         "pageTitle": db::kv_get(&conn, "page_title", "服务器探针"),
+        "avgLatencyHours": db::kv_get(&conn, "dash_avg_latency_hours", "8").parse::<u32>().unwrap_or(8).clamp(1, 24),
+        "avgLossHours": db::kv_get(&conn, "dash_avg_loss_hours", "8").parse::<u32>().unwrap_or(8).clamp(1, 24),
+        // 背景设置：图片 URL、不透明度(0-100)、模糊(px)、玻璃效果（none/frosted/liquid）
+        "bgImage": db::kv_get(&conn, "dash_bg_image", ""),
+        "bgOpacity": db::kv_get(&conn, "dash_bg_opacity", "100").parse::<u32>().unwrap_or(100).clamp(0, 100),
+        "bgBlur": db::kv_get(&conn, "dash_bg_blur", "0").parse::<u32>().unwrap_or(0).clamp(0, 40),
+        "bgGlass": db::kv_get(&conn, "dash_bg_glass", "none"),
+        "showRegions": db::kv_get(&conn, "dash_show_regions", "1") == "1",
+        "showFlags": db::kv_get(&conn, "dash_show_flags", "1") == "1",
     }))
     .into_response()
 }
@@ -821,6 +930,110 @@ async fn remove_probe_target(
     }
 }
 
+// ---------- 单服务器探测点排除 ----------
+
+/// 某服务器当前排除的探测点 id 列表
+async fn get_server_probe_excludes(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authorize_admin(&st, &headers) {
+        return e;
+    }
+    let conn = st.db.lock().unwrap();
+    if !db::server_exists(&conn, &id).unwrap_or(false) {
+        return (StatusCode::NOT_FOUND, "no such server").into_response();
+    }
+    match db::probe_excludes(&conn, &id) {
+        Ok(s) => Json(json!({ "excludes": s.into_iter().collect::<Vec<_>>() })).into_response(),
+        Err(e) => {
+            log::error!("{e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed").into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ProbeExcludesBody {
+    /// 要排除的探测点地址列表（与探测目标的 target 字段对应）
+    #[serde(default)]
+    excludes: Vec<String>,
+}
+
+/// 全量覆盖某服务器排除的探测点
+async fn set_server_probe_excludes(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(b): Json<ProbeExcludesBody>,
+) -> Response {
+    if let Err(e) = authorize_admin(&st, &headers) {
+        return e;
+    }
+    let conn = st.db.lock().unwrap();
+    if !db::server_exists(&conn, &id).unwrap_or(false) {
+        return (StatusCode::NOT_FOUND, "no such server").into_response();
+    }
+    // 只接受真实存在的探测点地址，脏值静默丢弃
+    let known: std::collections::HashSet<String> = db::probe_targets_all(&conn)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.target)
+        .collect();
+    let ts: Vec<String> = b.excludes.into_iter().filter(|t| known.contains(t)).collect();
+    match db::set_probe_excludes(&conn, &id, &ts) {
+        Ok(()) => (StatusCode::OK, "ok").into_response(),
+        Err(e) => {
+            log::error!("{e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "update failed").into_response()
+        }
+    }
+}
+
+// ---------- 单服务器上报间隔 / 失败阈值 ----------
+
+#[derive(Deserialize)]
+struct ServerTimingBody {
+    /// 上报间隔（秒），0 = 用系统设置全局值
+    #[serde(default)]
+    report_interval: Option<u64>,
+    /// 连续失败判离线次数，0 = 用全局默认
+    #[serde(default)]
+    fail_threshold: Option<u64>,
+}
+
+async fn set_server_timing(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(b): Json<ServerTimingBody>,
+) -> Response {
+    if let Err(e) = authorize_admin(&st, &headers) {
+        return e;
+    }
+    let conn = st.db.lock().unwrap();
+    if !db::server_exists(&conn, &id).unwrap_or(false) {
+        return (StatusCode::NOT_FOUND, "no such server").into_response();
+    }
+    // 沿用现有值：任一字段不传则保留该服务器行里的当前值
+    let cur = db::servers(&conn).ok().and_then(|v| v.into_iter().find(|s| s.id == id));
+    let (ri, ft) = match &cur {
+        Some(s) => (s.report_interval, s.fail_threshold),
+        None => (0, 0),
+    };
+    let ri = b.report_interval.map(|v| v.min(3600)).unwrap_or(ri);
+    let ft = b.fail_threshold.map(|v| v.min(100)).unwrap_or(ft);
+    match db::set_server_timing(&conn, &id, ri, ft) {
+        Ok(true) => (StatusCode::OK, "ok").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such server").into_response(),
+        Err(e) => {
+            log::error!("{e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "update failed").into_response()
+        }
+    }
+}
+
 // ---------- 网站监控 ----------
 
 async fn list_sites(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -917,6 +1130,12 @@ struct NotifyBody {
     offline_on: bool,
     #[serde(default = "default_true")]
     site_on: bool,
+    /// 离线模板（空=保持现有值；设为 "reset" 恢复默认）
+    #[serde(default)]
+    offline_tpl: Option<String>,
+    /// 恢复模板（空=保持现有值；设为 "reset" 恢复默认）
+    #[serde(default)]
+    recover_tpl: Option<String>,
 }
 
 async fn get_notify(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -928,6 +1147,9 @@ async fn get_notify(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     Json(json!({
         "channel": c.channel, "url": c.url, "secret": c.secret,
         "offline_on": c.offline_on, "site_on": c.site_on,
+        "offline_tpl": c.offline_tpl, "recover_tpl": c.recover_tpl,
+        "default_offline_tpl": crate::notify::DEFAULT_OFFLINE_TPL,
+        "default_recover_tpl": crate::notify::DEFAULT_RECOVER_TPL,
     }))
     .into_response()
 }
@@ -949,17 +1171,36 @@ async fn set_notify(
     if b.url.chars().count() > 512 || b.secret.chars().count() > 256 {
         return (StatusCode::BAD_REQUEST, "url/secret too long").into_response();
     }
+    // ponytail: 模板长度上限 2KB，覆盖所有合理模板且防滥用
+    const TPL_MAX: usize = 2048;
+    if let Some(t) = &b.offline_tpl { if t.chars().count() > TPL_MAX {
+        return (StatusCode::BAD_REQUEST, "offline_tpl too long").into_response();
+    }}
+    if let Some(t) = &b.recover_tpl { if t.chars().count() > TPL_MAX {
+        return (StatusCode::BAD_REQUEST, "recover_tpl too long").into_response();
+    }}
+    let mut c = {
+        let conn = st.db.lock().unwrap();
+        crate::notify::load_config(&conn)
+    };
+    c.channel = b.channel;
+    c.url = b.url.trim().to_string();
+    c.secret = b.secret.trim().to_string();
+    c.offline_on = b.offline_on;
+    c.site_on = b.site_on;
+    // 模板字段：None=保持；Some("")=留空但写入；Some("reset")=恢复默认。
+    match b.offline_tpl.as_deref() {
+        Some("reset") => c.offline_tpl = crate::notify::DEFAULT_OFFLINE_TPL.to_string(),
+        Some(t) => c.offline_tpl = t.to_string(),
+        None => {}
+    }
+    match b.recover_tpl.as_deref() {
+        Some("reset") => c.recover_tpl = crate::notify::DEFAULT_RECOVER_TPL.to_string(),
+        Some(t) => c.recover_tpl = t.to_string(),
+        None => {}
+    }
     let conn = st.db.lock().unwrap();
-    crate::notify::save_config(
-        &conn,
-        &crate::notify::NotifyConfig {
-            channel: b.channel,
-            url: b.url.trim().to_string(),
-            secret: b.secret.trim().to_string(),
-            offline_on: b.offline_on,
-            site_on: b.site_on,
-        },
-    );
+    crate::notify::save_config(&conn, &c);
     (StatusCode::OK, "ok").into_response()
 }
 
@@ -1073,14 +1314,23 @@ async fn backup_export(State(st): State<Arc<AppState>>, headers: HeaderMap) -> R
             "notify_secret": db::kv_get(&conn, "notify_secret", ""),
             "notify_offline_on": db::kv_get(&conn, "notify_offline_on", "1"),
             "notify_site_on": db::kv_get(&conn, "notify_site_on", "1"),
+            "notify_offline_tpl": db::kv_get(&conn, "notify_offline_tpl", crate::notify::DEFAULT_OFFLINE_TPL),
+            "notify_recover_tpl": db::kv_get(&conn, "notify_recover_tpl", crate::notify::DEFAULT_RECOVER_TPL),
             "active_theme": db::kv_get(&conn, "active_theme", "极简白"),
             "dash_disks_total_only": db::kv_get(&conn, "dash_disks_total_only", "1"),
             "dash_show_traffic": db::kv_get(&conn, "dash_show_traffic", "1"),
+            "dash_show_rate": db::kv_get(&conn, "dash_show_rate", "1"),
+            "dash_show_window_total": db::kv_get(&conn, "dash_show_window_total", "1"),
+            "dash_show_traffic_total": db::kv_get(&conn, "dash_show_traffic_total", "1"),
+            "dash_show_uptime": db::kv_get(&conn, "dash_show_uptime", "1"),
+            "dash_show_last_seen": db::kv_get(&conn, "dash_show_last_seen", "1"),
             "dash_probe_hours": db::kv_get(&conn, "dash_probe_hours", "8"),
             "dash_loss_hours": db::kv_get(&conn, "dash_loss_hours", "8"),
             "report_interval": db::kv_get(&conn, "report_interval", "0"),
         },
         "probe_targets": db::probe_targets_all(&conn).unwrap_or_default(),
+        // 单台服务器的探测点排除（按 target 地址，恢复时不受 id 漂移影响）
+        "probe_excludes": db::all_probe_excludes(&conn).unwrap_or_default(),
         "sites": db::sites(&conn).unwrap_or_default(),
         "themes": db::themes(&conn).unwrap_or_default().into_iter().filter(|t| !t.builtin).collect::<Vec<_>>(),
         // 所有历史指标（磁盘、CPU、内存、网络、探针）
@@ -1094,6 +1344,9 @@ struct RestoreBody {
     kv: std::collections::HashMap<String, serde_json::Value>,
     #[serde(default)]
     probe_targets: Vec<db::ProbeTargetRow>,
+    /// 单台服务器的探测点排除（server_id, target 地址）二元组
+    #[serde(default)]
+    probe_excludes: Vec<(String, String)>,
     #[serde(default)]
     sites: Vec<db::SiteRow>,
     /// 可选：要还原的指标历史（settings-only 备份里没有这一项）
@@ -1114,10 +1367,15 @@ async fn restore_import(
         "probe_target", "probe_method", "probe_count",
         "notify_channel", "notify_url", "notify_secret",
         "notify_offline_on", "notify_site_on",
-        "active_theme", "dash_disks_total_only", "dash_show_traffic", "report_interval",
+        "notify_offline_tpl", "notify_recover_tpl",
+        "active_theme", "dash_disks_total_only", "dash_show_traffic", "dash_show_rate", "dash_show_window_total", "dash_show_traffic_total",
+ "dash_show_uptime", "dash_show_last_seen", "report_interval", "fail_threshold",
         "dash_probe_hours", "dash_loss_hours",
         "dash_show_latency_chart", "dash_show_loss_chart", "dash_show_cpu_chart",
         "admin_path", "dash_show_admin_link", "site_title", "page_title",
+        "dash_avg_latency_hours", "dash_avg_loss_hours",
+        "dash_bg_image", "dash_bg_opacity", "dash_bg_blur",
+        "dash_bg_glass", "dash_show_regions", "dash_show_flags",
     ];
     let conn = st.db.lock().unwrap();
     let res = (|| -> anyhow::Result<()> {
@@ -1132,6 +1390,7 @@ async fn restore_import(
         for t in &b.probe_targets {
             db::add_probe_target(&conn, &t.name, &t.target, &t.method)?;
         }
+        db::restore_probe_excludes(&conn, &b.probe_excludes)?;
         conn.execute("DELETE FROM sites", [])?;
         for s in &b.sites {
             db::upsert_site(&conn, None, &s.name, &s.url, s.interval_s, s.enabled)?;
@@ -1236,11 +1495,27 @@ struct SettingsBody {
     dash_disks_total_only: Option<bool>,
     #[serde(default)]
     dash_show_traffic: Option<bool>,
+    /// 流量三子开关：速率 / 区间累计 / 总计（仅在 showTraffic 打开时生效）
+    #[serde(default)]
+    dash_show_rate: Option<bool>,
+    #[serde(default)]
+    dash_show_window_total: Option<bool>,
+    #[serde(default)]
+    dash_show_traffic_total: Option<bool>,
+    /// 卡片显示运行时长
+    #[serde(default)]
+    dash_show_uptime: Option<bool>,
+    /// 卡片显示最后上报时间
+    #[serde(default)]
+    dash_show_last_seen: Option<bool>,
     #[serde(default)]
     retention_days: Option<u32>,
     /// agent 上报间隔（秒），0 = 沿用 CLI 的 MONITOR_INTERVAL
     #[serde(default)]
     report_interval: Option<u64>,
+    /// 连续上报失败次数阈值（1-100，默认 3）
+    #[serde(default)]
+    fail_threshold: Option<u64>,
     #[serde(default)]
     dash_probe_hours: Option<u32>,
     #[serde(default)]
@@ -1266,6 +1541,30 @@ struct SettingsBody {
     /// 浏览器标签页标题（<title>）
     #[serde(default)]
     page_title: Option<String>,
+    /// 卡片平均延迟统计时长（小时，1-24）
+    #[serde(default)]
+    dash_avg_latency_hours: Option<u32>,
+    /// 卡片平均丢包统计时长（小时，1-24）
+    #[serde(default)]
+    dash_avg_loss_hours: Option<u32>,
+    /// 仪表盘背景图 URL（http/https 或空）
+    #[serde(default)]
+    dash_bg_image: Option<String>,
+    /// 背景不透明度（0-100）
+    #[serde(default)]
+    dash_bg_opacity: Option<u32>,
+    /// 背景模糊（px，0-40）
+    #[serde(default)]
+    dash_bg_blur: Option<u32>,
+    /// 卡片玻璃效果：none / frosted（毛玻璃）/ liquid（液态玻璃）
+    #[serde(default)]
+    dash_bg_glass: Option<String>,
+    /// 仪表盘顶部显示「N 地区点亮」及地区国旗
+    #[serde(default)]
+    dash_show_regions: Option<bool>,
+    /// 卡片在线状态旁显示国旗
+    #[serde(default)]
+    dash_show_flags: Option<bool>,
 }
 
 async fn get_settings(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1276,8 +1575,14 @@ async fn get_settings(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
     Json(json!({
         "dash_disks_total_only": db::kv_get(&conn, "dash_disks_total_only", "1") == "1",
         "dash_show_traffic": db::kv_get(&conn, "dash_show_traffic", "1") == "1",
+        "dash_show_rate": db::kv_get(&conn, "dash_show_rate", "1") == "1",
+        "dash_show_window_total": db::kv_get(&conn, "dash_show_window_total", "1") == "1",
+        "dash_show_traffic_total": db::kv_get(&conn, "dash_show_traffic_total", "1") == "1",
+        "dash_show_uptime": db::kv_get(&conn, "dash_show_uptime", "1") == "1",
+        "dash_show_last_seen": db::kv_get(&conn, "dash_show_last_seen", "1") == "1",
         "retention_days": db::kv_get(&conn, "retention_days", "30").parse::<u32>().unwrap_or(30),
         "report_interval": db::kv_get(&conn, "report_interval", "0").parse::<u64>().unwrap_or(0),
+        "fail_threshold": db::kv_get(&conn, "fail_threshold", "3").parse::<u64>().unwrap_or(3).clamp(1, 100),
         "dash_probe_hours": db::kv_get(&conn, "dash_probe_hours", "8").parse::<u32>().unwrap_or(8),
         "dash_loss_hours": db::kv_get(&conn, "dash_loss_hours", "8").parse::<u32>().unwrap_or(8),
         "dash_show_latency_chart": db::kv_get(&conn, "dash_show_latency_chart", "1") == "1",
@@ -1287,6 +1592,14 @@ async fn get_settings(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
         "dash_show_admin_link": db::kv_get(&conn, "dash_show_admin_link", "1") == "1",
         "site_title": db::kv_get(&conn, "site_title", "服务器探针"),
         "page_title": db::kv_get(&conn, "page_title", "服务器探针"),
+        "dash_avg_latency_hours": db::kv_get(&conn, "dash_avg_latency_hours", "8"),
+        "dash_avg_loss_hours": db::kv_get(&conn, "dash_avg_loss_hours", "8"),
+        "dash_bg_image": db::kv_get(&conn, "dash_bg_image", ""),
+        "dash_bg_opacity": db::kv_get(&conn, "dash_bg_opacity", "100"),
+        "dash_bg_blur": db::kv_get(&conn, "dash_bg_blur", "0"),
+        "dash_bg_glass": db::kv_get(&conn, "dash_bg_glass", "none"),
+        "dash_show_regions": db::kv_get(&conn, "dash_show_regions", "1") == "1",
+        "dash_show_flags": db::kv_get(&conn, "dash_show_flags", "1") == "1",
     }))
     .into_response()
 }
@@ -1306,11 +1619,29 @@ async fn set_settings(
     if let Some(v) = b.dash_show_traffic {
         db::kv_set(&conn, "dash_show_traffic", if v { "1" } else { "0" });
     }
+    if let Some(v) = b.dash_show_rate {
+        db::kv_set(&conn, "dash_show_rate", if v { "1" } else { "0" });
+    }
+    if let Some(v) = b.dash_show_window_total {
+        db::kv_set(&conn, "dash_show_window_total", if v { "1" } else { "0" });
+    }
+    if let Some(v) = b.dash_show_traffic_total {
+        db::kv_set(&conn, "dash_show_traffic_total", if v { "1" } else { "0" });
+    }
+    if let Some(v) = b.dash_show_uptime {
+        db::kv_set(&conn, "dash_show_uptime", if v { "1" } else { "0" });
+    }
+    if let Some(v) = b.dash_show_last_seen {
+        db::kv_set(&conn, "dash_show_last_seen", if v { "1" } else { "0" });
+    }
     if let Some(d) = b.retention_days {
         db::kv_set(&conn, "retention_days", &d.min(3650).to_string());
     }
     if let Some(s) = b.report_interval {
         db::kv_set(&conn, "report_interval", &s.min(3600).to_string());
+    }
+    if let Some(n) = b.fail_threshold {
+        db::kv_set(&conn, "fail_threshold", &n.clamp(1, 100).to_string());
     }
     // 仪表盘折线图窗口（小时）；超出范围夹回 1..=72
     if let Some(h) = b.dash_probe_hours {
@@ -1339,6 +1670,38 @@ async fn set_settings(
     }
     if let Some(v) = &b.page_title {
         db::kv_set(&conn, "page_title", v.trim());
+    }
+    if let Some(h) = b.dash_avg_latency_hours {
+        db::kv_set(&conn, "dash_avg_latency_hours", &h.clamp(1, 24).to_string());
+    }
+    if let Some(h) = b.dash_avg_loss_hours {
+        db::kv_set(&conn, "dash_avg_loss_hours", &h.clamp(1, 24).to_string());
+    }
+    if let Some(v) = &b.dash_bg_image {
+        // 仅 http(s) URL 或空；防 javascript: 注入
+        let v = v.trim();
+        if !v.is_empty() && !(v.starts_with("http://") || v.starts_with("https://")) {
+            return (StatusCode::BAD_REQUEST, "bg image must be http(s) url or empty").into_response();
+        }
+        db::kv_set(&conn, "dash_bg_image", v);
+    }
+    if let Some(v) = b.dash_bg_opacity {
+        db::kv_set(&conn, "dash_bg_opacity", &v.clamp(0, 100).to_string());
+    }
+    if let Some(v) = b.dash_bg_blur {
+        db::kv_set(&conn, "dash_bg_blur", &v.clamp(0, 40).to_string());
+    }
+    if let Some(v) = &b.dash_bg_glass {
+        if !["none", "frosted", "liquid"].contains(&v.as_str()) {
+            return (StatusCode::BAD_REQUEST, "glass must be none/frosted/liquid").into_response();
+        }
+        db::kv_set(&conn, "dash_bg_glass", v);
+    }
+    if let Some(v) = b.dash_show_regions {
+        db::kv_set(&conn, "dash_show_regions", if v { "1" } else { "0" });
+    }
+    if let Some(v) = b.dash_show_flags {
+        db::kv_set(&conn, "dash_show_flags", if v { "1" } else { "0" });
     }
     (StatusCode::OK, "ok").into_response()
 }
@@ -1417,16 +1780,18 @@ mod tests {
     #[test]
     fn online_window_boundaries() {
         let now = chrono::Utc::now();
-        // 默认（interval=0 → 10s 周期 → 35s 窗口 + 600s 宽限）
+        // 默认（interval=0 → 10s 周期 → 30s 窗口，下限 35s）
         assert!(is_online(&(now - chrono::Duration::seconds(5)).to_rfc3339(), 0));
-        assert!(!is_online(&(now - chrono::Duration::seconds(700)).to_rfc3339(), 0));
+        assert!(!is_online(&(now - chrono::Duration::seconds(36)).to_rfc3339(), 0));
         assert!(!is_online("garbage", 0));
-        // 5 分钟上报周期 → 15 分钟窗口 + 宽限
+        // 5 分钟上报周期 → 15 分钟窗口
         assert!(is_online(&(now - chrono::Duration::seconds(600)).to_rfc3339(), 300));
-        assert!(!is_online(&(now - chrono::Duration::seconds(1600)).to_rfc3339(), 300));
-        assert_eq!(online_window_secs(0), 635);
-        assert_eq!(online_window_secs(300), 1500);
-        assert_eq!(online_window_secs(5), 635);
+        assert!(!is_online(&(now - chrono::Duration::seconds(901)).to_rfc3339(), 300));
+        assert_eq!(online_window_secs(0), 35);   // 下限兜底
+        assert_eq!(online_window_secs(10), 35);  // 3*10=30，下限 35 兜底
+        assert_eq!(online_window_secs(12), 36);  // 3*12=36，超过下限
+        assert_eq!(online_window_secs(300), 900); // 3 * 5min
+        assert_eq!(online_window_secs(5), 35);   // 15s < 35s 下限
     }
 
     #[test]
@@ -1445,5 +1810,29 @@ mod tests {
         assert_eq!(normalize_admin_path("api"), "/admin"); // 禁保留段
         assert_eq!(normalize_admin_path("管理"), "/admin"); // 仅 ASCII
         assert_eq!(normalize_admin_path(&"x".repeat(33)), "/admin");
+    }
+
+    #[test]
+    fn filter_excluded_probes_drops_matching_addresses() {
+        // 用 set_probe_excludes 把 1.1.1.1 加进排除；其余不变。
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let id = "test-srv";
+        crate::db::set_probe_excludes(&conn, id, &["1.1.1.1".into()]).unwrap();
+
+        let mut probes = vec![
+            NetworkProbe { target: "CF|1.1.1.1".into(),   ..sample() },
+            NetworkProbe { target: "GG|8.8.8.8".into(),   ..sample() },
+            NetworkProbe { target: "raw:no-prefix".into(),..sample() },
+        ];
+        filter_excluded_probes(&conn, id, &mut probes);
+        let addrs: Vec<&str> = probes.iter().map(|p| {
+            p.target.split_once('|').map(|(_, a)| a).unwrap_or(&p.target)
+        }).collect();
+        assert_eq!(addrs, vec!["8.8.8.8", "raw:no-prefix"]);
+    }
+
+    fn sample() -> NetworkProbe {
+        NetworkProbe::default()
     }
 }
