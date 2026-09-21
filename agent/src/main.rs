@@ -158,12 +158,35 @@ fn main() -> Result<()> {
     /// 而不是傻等完旧的 5 分钟。间隔被调大时按新值重新睡（多睡的不退）。
     /// ponytail: 首轮上报在循环开头，间隔改动最多滞后 STEP 秒生效。
     const STEP: u64 = 15;
+    // 拉取式指令轮询：与配置刷新共用 15s 节拍。trigger → 立即上报；update → 自更新。
+    let poll_cmds = |trigger: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+                     self_version: &str| {
+        let mut req = agent.get(&format!("{}/api/agent-cmd?hostname={}", cli.url.trim_end_matches('/'),
+            urlencode(host.as_deref().unwrap_or_default())));
+        if let Some(t) = cli.token.as_deref() {
+            req = req.header("x-token", t);
+        }
+        let Ok(mut resp) = req.call() else { return; };
+        let Ok(body) = resp.body_mut().read_to_vec() else { return; };
+        let Ok(cmd) = serde_json::from_slice::<serde_json::Value>(&body) else { return; };
+        if cmd.get("trigger").and_then(|v| v.as_bool()) == Some(true) {
+            log::info!("轮询收到主动触发指令");
+            trigger.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if cmd.get("update").and_then(|v| v.as_bool()) == Some(true) {
+            // 版本落后的信号（monitor 比对了 client_version）→ 立刻查详细版本并自更新
+            if let Err(e) = check_self_update(&cli.url, cli.token.as_deref(), cli.proxy.as_deref(), self_version) {
+                log::debug!("自更新: {e:#}");
+            }
+        }
+    };
     let sleep_interval = |cfg: &mut collect::AgentProbeCfg| {
         let mut left = pick_interval(cli.interval, cfg.report_interval);
         while left > 0 {
             let nap = left.min(STEP);
             std::thread::sleep(Duration::from_secs(nap));
             left -= nap;
+            poll_cmds(&trigger, &self_version);
             *cfg = collect::fetch_probe_config(
                 &agent,
                 &cli.url,
@@ -335,6 +358,18 @@ Connection: close
         );
         let _ = std::io::Write::write_all(&mut s, resp.as_bytes());
     }
+}
+
+/// 最小 percent-encode：query 参数安全字符之外全部转义
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// 解析 "0.0.0.0:9119" → 9119（失败兜底 0=关闭）

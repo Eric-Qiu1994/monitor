@@ -600,11 +600,13 @@ async function editAddr(id, cur) {
   }
 }
 
-// 主动触发：中心机 → agent /trigger → agent 立即采集上报
+// 主动触发：能直连 agent 就直连（~3s）；不能（NAT/防火墙）就入拉取队列，agent ≤15s 轮询取走
 async function triggerServer(id, name) {
   try {
     const r = await api('POST', `/api/admin/servers/${id}/trigger`);
-    say('srvMsg', `已触发「${name}」主动上报，等待 agent 响应（最长 ~3 秒）`, 'ok');
+    say('srvMsg', r.via === 'queued'
+      ? `已下发触发指令给「${name}」（agent 在 NAT 后走轮询通道，≤15 秒内上报）`
+      : `已触发「${name}」主动上报，等待 agent 响应（最长 ~3 秒）`, 'ok');
   } catch (e) {
     if (String(e.message).startsWith('400')) {
       say('srvMsg', `「${name}」的 agent 未开启反向通道（需升级到 v0.1.7+）`, 'err');

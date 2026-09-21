@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
         db: db.clone(),
         token: cli.token.clone(),
         host: std::sync::Arc::new(host::HostSampler::start()),
+        cmds: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
     let app = api::router(state);
 

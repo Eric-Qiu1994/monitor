@@ -21,6 +21,9 @@ pub struct AppState {
     pub db: Db,
     pub token: Option<String>,
     pub host: SharedSampler,
+    /// 拉取式指令队列：server_id → 待执行指令。trigger 直连失败时入队，
+    /// agent 轮询 /api/agent-cmd 时取出（NAT/防火墙免疫，走 agent→monitor 已有方向）。
+    pub cmds: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -34,6 +37,8 @@ pub fn router(state: AppState) -> Router {
         // agent
         .route("/api/report", post(report))
         .route("/api/agent-config", get(agent_config))
+        // 拉取式指令通道：agent 轮询（x-token 鉴权同 report）
+        .route("/api/agent-cmd", get(agent_cmd))
         // 服务器
         .route("/api/servers", get(list_servers))
         .route("/api/servers/{id}", get(get_server))
@@ -1115,10 +1120,42 @@ async fn trigger_server(
             .build(),
     );
     match agent.get(&url).call() {
-        Ok(r) if r.status().as_u16() < 400 => Json(json!({"ok": true})).into_response(),
-        Ok(r) => (StatusCode::BAD_GATEWAY, format!("agent 返回 {}", r.status())).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("触发失败: {e}")).into_response(),
+        Ok(r) if r.status().as_u16() < 400 => Json(json!({"ok": true, "via": "direct"})).into_response(),
+        _ => {
+            // 直连不通（NAT/防火墙）→ 入拉取队列，agent 下次轮询（≤15s）取走
+            st.cmds.lock().unwrap().insert(id, std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
+            Json(json!({"ok": true, "via": "queued"})).into_response()
+        }
     }
+}
+
+/// 拉取式指令通道：agent 轮询。返回 {"trigger":bool,"update":bool}
+/// update 由 monitor 比较 DB 里该 agent 的 client_version 与自身版本得出——
+/// agent 不用自己查版本，轮询顺便发现新版本（自更新 bootstrap 之外的常态路径）。
+async fn agent_cmd(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<serde_json::Value>,
+) -> Response {
+    if let Err(e) = authorize(&st, &headers) {
+        return e;
+    }
+    let Some(hostname) = q.get("hostname").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+        return (StatusCode::BAD_REQUEST, "missing hostname").into_response();
+    };
+    let id = db::server_id_for(&hostname);
+    let trigger = st.cmds.lock().unwrap().remove(&id).is_some();
+    // 版本比较：agent 上报的 client_version ≠ monitor 自身版本 → 下发更新
+    let update = {
+        let conn = st.db.lock().unwrap();
+        db::servers(&conn)
+            .ok()
+            .and_then(|v| v.into_iter().find(|x| x.id == id))
+            .map(|s| !s.client_version.is_empty() && s.client_version != env!("CARGO_PKG_VERSION"))
+            .unwrap_or(false)
+    };
+    Json(json!({"trigger": trigger, "update": update})).into_response()
 }
 
 /// 后台手动覆盖 agent 反向连接地址（NAT 主机场景——monitor 看到的 IP 无法回连）
