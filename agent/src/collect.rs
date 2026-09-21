@@ -45,6 +45,10 @@ pub struct Collector {
     nets: Networks,
     disks: Disks,
     hostname: Option<String>,
+    // 上次拿到的对外公网 IP（含 v4/v6），按 30 分钟节流。
+    // ponytail: 全局一个缓存，多主机共享——NAT 主机公网 IP 几乎不变，
+    // 真有变动用户重启 agent 即可；要做 per-host 缓存再加 HashMap<String,(String,String)>
+    public_ips: Option<(String, String, Instant)>,
 }
 
 impl Collector {
@@ -60,6 +64,7 @@ impl Collector {
             nets: Networks::new_with_refreshed_list(),
             disks: Disks::new_with_refreshed_list(),
             hostname: hostname.map(str::to_string),
+            public_ips: None,
         }
     }
 
@@ -108,7 +113,14 @@ impl Collector {
             .iter()
             .flat_map(|(n, d)| d.ip_networks().iter().map(move |ipn| (n.clone(), ipn.addr)))
             .collect();
-        let (ipv4, ipv6) = pick_local_ips(&ifaces);
+        let (local_v4, local_v6) = pick_local_ips(&ifaces);
+        let (ipv4, ipv6) = match self.fetch_public_ips_cached() {
+            Some((p4, p6)) => (
+                if p4.is_empty() { local_v4 } else { p4 },
+                if p6.is_empty() { local_v6 } else { p6 },
+            ),
+            None => (local_v4, local_v6),
+        };
 
         // 单目标 probe 只在没有多目标配置时才真正发包，避免重复 ping
         let (probe, probes): (NetworkProbe, Vec<NetworkProbe>) = if targets.is_empty() {
@@ -201,6 +213,49 @@ pub fn pick_local_ips(ifaces: &[(String, std::net::IpAddr)]) -> (String, String)
 
 /// 同一块盘被重复挂载（Docker overlayfs、容器 bind mount）时只保留挂载点最短的那条。
 /// 判定为"同一块盘"：total 与 used 都相同；容量相同但用量不同则各自保留。
+/// NAT 主机：本机 NIC 都是私网（如 192.168.x/10.x），用户要看到的是「外网视角」IP。
+/// 用 ipify 的 v4/v6 端点现拉：失败超时一律不阻塞上报，本字段留空。
+/// ponytail: 无代理（要代理=env 污染 bug 的重演）；要支持给公网探测加代理再说。
+fn fetch_public_ips_now() -> (String, String) {
+    // ponytail: 独立 agent，不复用 build_agent——公网 IP 探测不该走 MONITOR_PROXY，
+    // 走代理反而把 NAT 主机的「外网视角」换成了代理出口 NAT 后 IP，得不偿失。
+    let agent = || {
+        ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(std::time::Duration::from_secs(4)))
+                .build(),
+        )
+    };
+    let get = |u: &str| -> Option<String> {
+        let mut r = agent().get(u).call().ok()?;
+        let s = r.body_mut().read_to_string().ok()?;
+        let s = s.trim().to_string();
+        (!s.is_empty()).then_some(s)
+    };
+    let v4 = get("https://api.ipify.org").filter(|s| s.parse::<std::net::Ipv4Addr>().is_ok());
+    let v6 = get("https://api64.ipify.org").filter(|s| s.parse::<std::net::Ipv6Addr>().is_ok());
+    (v4.unwrap_or_default(), v6.unwrap_or_default())
+}
+
+impl Collector {
+    /// 30 分钟节流。返回 None 表示暂不刷新（仍用旧缓存；首次没缓存时强制一次）。
+    fn fetch_public_ips_cached(&mut self) -> Option<(String, String)> {
+        const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+        let now = Instant::now();
+        let (need, prev) = match &self.public_ips {
+            None => (true, None),
+            Some((_, _, ts)) if now.duration_since(*ts) >= CACHE_TTL => (true, None),
+            Some(c) => (false, Some(c.clone())),
+        };
+        if !need {
+            return prev.map(|(a, b, _)| (a, b));
+        }
+        let (v4, v6) = fetch_public_ips_now();
+        self.public_ips = Some((v4.clone(), v6.clone(), now));
+        Some((v4, v6))
+    }
+}
+
 pub fn dedup_disks<'a>(disks: impl Iterator<Item = &'a sysinfo::Disk>) -> Vec<DiskInfo> {
     let mut out: Vec<DiskInfo> = Vec::new();
     for d in disks.filter(|d| d.total_space() > 0) {
@@ -623,6 +678,32 @@ mod tests {
         assert_eq!(a.cpu_cores, b.cpu_cores);
         // 累计流量只会增长
         assert!(b.net.rx >= a.net.rx);
+    }
+
+    #[test]
+    fn fetch_public_ips_now_returns_valid_or_empty() {
+        // 公网探测实时打 ipify；CI/无网环境拿不到合法地址时返回空串，不能 panic。
+        let (v4, v6) = fetch_public_ips_now();
+        if !v4.is_empty() {
+            assert!(v4.parse::<std::net::Ipv4Addr>().is_ok(), "v4 必须是合法 IPv4: {v4}");
+        }
+        if !v6.is_empty() {
+            assert!(v6.parse::<std::net::Ipv6Addr>().is_ok(), "v6 必须是合法 IPv6: {v6}");
+        }
+    }
+
+    #[test]
+    fn public_ip_cached_throttles_repeated_calls() {
+        // ponytail: 直接构造 Collector 强制不走 sample_with_probe（sample 会阻塞 CPU 两次刷新 ~1s），
+        // 只测缓存节流语义本身。
+        let mut c = Collector::new(Some("unit"));
+        c.public_ips = Some(("1.1.1.1".into(), "".into(), Instant::now()));
+        // 30 分钟内直接返回缓存，不该自打出去
+        let got = c.fetch_public_ips_cached().unwrap();
+        assert_eq!(got.0, "1.1.1.1");
+        // 过期时即使没命中过网络（公网探测若返回空就拿空），也不该 panic。
+        c.public_ips = Some(("".into(), "".into(), Instant::now() - std::time::Duration::from_secs(31 * 60)));
+        let _ = c.fetch_public_ips_cached();
     }
 
     #[test]
