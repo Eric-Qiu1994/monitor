@@ -65,6 +65,11 @@ pub struct Report {
     pub probes: Vec<NetworkProbe>,
     /// 累计进程数
     pub processes: u64,
+    /// 本机 IPv4 / IPv6（agent 自采，空串 = 无该族地址或旧 agent 未上报）
+    #[serde(default)]
+    pub ipv4: String,
+    #[serde(default)]
+    pub ipv6: String,
 }
 
 impl Report {

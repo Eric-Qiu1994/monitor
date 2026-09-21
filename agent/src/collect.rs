@@ -101,6 +101,15 @@ impl Collector {
         // 容量与已用都相同才认为是同一块盘，容量相同但用量不同仍各自保留。
         let disks = dedup_disks(self.disks.list().iter());
 
+        // 本机地址：跳 lo/docker/br-/veth 等虚拟网卡，公网优先、其次私网，各取一个
+        let ifaces: Vec<(String, std::net::IpAddr)> = self
+            .nets
+            .list()
+            .iter()
+            .flat_map(|(n, d)| d.ip_networks().iter().map(move |ipn| (n.clone(), ipn.addr)))
+            .collect();
+        let (ipv4, ipv6) = pick_local_ips(&ifaces);
+
         // 单目标 probe 只在没有多目标配置时才真正发包，避免重复 ping
         let (probe, probes): (NetworkProbe, Vec<NetworkProbe>) = if targets.is_empty() {
             let p = run_probe(cfg);
@@ -146,8 +155,48 @@ impl Collector {
             probe,
             probes,
             processes: self.sys.processes().len() as u64,
+            ipv4,
+            ipv6,
         })
     }
+}
+
+/// 从本机网卡地址里各挑一个 IPv4 / IPv6 用于展示。
+/// 跳回环、链路本地、Docker/bridge/veth 虚拟网卡；公网优先，其次私网；同类取首个。
+/// ponytail: 只上报一个地址；要完整列表再把返回值扩成 Vec。
+pub fn pick_local_ips(ifaces: &[(String, std::net::IpAddr)]) -> (String, String) {
+    use std::net::IpAddr;
+    let virtual_iface = |n: &str| {
+        ["lo", "docker", "br-", "veth", "virbr", "tun", "tap"]
+            .iter()
+            .any(|p| n.starts_with(p))
+    };
+    // 分数越小越优先：0 公网、1 私网
+    let mut best: [Option<(u8, IpAddr)>; 2] = [None, None];
+    for (name, ip) in ifaces {
+        if virtual_iface(name) {
+            continue;
+        }
+        let (idx, score) = match ip {
+            IpAddr::V4(a) => {
+                if a.is_loopback() || a.is_link_local() || a.is_unspecified() {
+                    continue;
+                }
+                (0, u8::from(a.is_private()))
+            }
+            IpAddr::V6(a) => {
+                if a.is_loopback() || a.is_unicast_link_local() || a.is_unspecified() {
+                    continue;
+                }
+                (1, u8::from(a.is_unique_local()))
+            }
+        };
+        if best[idx].is_none_or(|(s, _)| score < s) {
+            best[idx] = Some((score, *ip));
+        }
+    }
+    let out = best.map(|b| b.map(|(_, a)| a.to_string()).unwrap_or_default());
+    (out[0].clone(), out[1].clone())
 }
 
 /// 同一块盘被重复挂载（Docker overlayfs、容器 bind mount）时只保留挂载点最短的那条。
@@ -574,6 +623,35 @@ mod tests {
         assert_eq!(a.cpu_cores, b.cpu_cores);
         // 累计流量只会增长
         assert!(b.net.rx >= a.net.rx);
+    }
+
+    #[test]
+    fn pick_local_ips_prefers_public_and_skips_virtual_ifaces() {
+        use std::net::IpAddr;
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let ifaces: Vec<(String, IpAddr)> = [
+            ("lo", "127.0.0.1"),
+            ("docker0", "172.17.0.1"),
+            ("veth1a2b", "10.9.9.9"),
+            ("eth0", "192.168.1.9"),
+            ("eth0", "203.0.113.7"),
+            ("eth0", "169.254.1.2"),
+            ("eth0", "fe80::1"),
+            ("eth0", "fd00::1"),
+            ("eth0", "2001:db8::7"),
+        ]
+        .iter()
+        .map(|(n, a)| (n.to_string(), ip(a)))
+        .collect();
+        assert_eq!(
+            pick_local_ips(&ifaces),
+            ("203.0.113.7".to_string(), "2001:db8::7".to_string()),
+            "公网优先、虚拟网卡与链路本地应被跳过"
+        );
+        assert_eq!(pick_local_ips(&[]), (String::new(), String::new()));
+        // 只有私网时退而取私网
+        let only_private = vec![("eth0".to_string(), ip("10.1.2.3"))];
+        assert_eq!(pick_local_ips(&only_private).0, "10.1.2.3");
     }
 
     #[test]

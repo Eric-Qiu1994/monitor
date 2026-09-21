@@ -38,6 +38,15 @@ ul.list li { padding: 10px; border: 1px solid var(--border); border-radius: var(
   margin-bottom: 8px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 ul.list li.active { border-color: var(--accent); }
 ul.list .nm { font-weight: 600; }
+/* 服务器表：列头对齐，窄屏横向滚动 */
+.tblwrap { overflow-x: auto; }
+table.tbl { border-collapse: collapse; width: 100%; font-size: 12px; }
+table.tbl th, table.tbl td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border);
+  white-space: nowrap; }
+table.tbl th { font-weight: 500; color: var(--muted); }
+table.tbl td.mono, table.tbl th.mono { font-family: var(--mono); }
+table.tbl tbody tr:hover { background: var(--bg); }
+table.tbl button { padding: 2px 7px; font-size: 11px; font-weight: 500; }
 .pill { display: inline-block; padding: 1px 8px; font-size: 11px; border: 1px solid var(--border);
   color: var(--muted); border-radius: var(--radius); }
 .msg { margin-top: 10px; font-size: 12px; min-height: 18px; }
@@ -127,7 +136,16 @@ dialog::backdrop { background: rgba(0,0,0,.45); }
   <div class="page active" id="page-servers">
     <h2 class="ptitle">服务器</h2>
     <div class="card">
-      <ul class="list" id="srvList"><li class="muted">加载中…</li></ul>
+      <div class="tblwrap">
+        <table class="tbl">
+          <thead><tr>
+            <th>别名</th><th>名称</th><th>状态</th><th>磁盘</th>
+            <th class="mono">IPv4</th><th class="mono">IPv6</th>
+            <th>系统</th><th>地区</th><th>操作</th>
+          </tr></thead>
+          <tbody id="srvList"><tr><td class="muted" colspan="9">加载中…</td></tr></tbody>
+        </table>
+      </div>
       <div class="msg" id="srvMsg"></div>
     </div>
   </div>
@@ -542,19 +560,24 @@ async function loadServers() {
     $('srvList').innerHTML = servers.map(s => {
       const m = s.latest || {};
       const diskTotal = (m.disks || []).reduce((a, d) => a + (d.total || 0), 0);
-      return `<li>
-        <span class="nm">${esc(s.name)}</span>
-        <span class="muted">${esc(s.hostname)}</span>
-        <span class="pill">${s.online ? '在线' : '离线'}</span>
-        <span class="muted">磁盘 ${(diskTotal / 1073741824).toFixed(0)} GB</span>
-        <span class="spacer" style="flex:1"></span>
-        <span class="muted">${s.country ? flagEmoji(s.country) : ''}</span>
-        <button class="ghost" onclick="renameServer('${s.id}', '${esc(s.name)}')">改别名</button>
-        <button class="ghost" onclick="openProbeDlg('${s.id}', '${esc(s.name)}')">检测点</button>
-        <button class="ghost" onclick="setTiming('${s.id}', ${s.report_interval || 0}, ${s.fail_threshold || 0})">上报设置</button>
-        <button class="ghost" onclick="delServer('${s.id}', '${esc(s.name)}')">删除数据</button>
-      </li>`;
-    }).join('') || '<li class="muted">暂无服务器</li>';
+      return `<tr>
+        <td class="nm">${esc(s.name)}</td>
+        <td class="muted">${esc(s.hostname)}</td>
+        <td><span class="pill">${s.online ? '在线' : '离线'}</span></td>
+        <td class="muted">${(diskTotal / 1073741824).toFixed(0)} GB</td>
+        <td class="mono">${esc(s.ipv4 || '—')}</td>
+        <td class="mono">${esc(s.ipv6 || '—')}</td>
+        <td class="muted">${esc(s.os || '—')}</td>
+        <td class="muted">${s.country ? `${flagEmoji(s.country)} ${esc(s.country)}` : '—'}</td>
+        <td>
+          <button class="ghost" onclick="renameServer('${s.id}', '${esc(s.name)}')">改名</button>
+          <button class="ghost" onclick="openProbeDlg('${s.id}', '${esc(s.name)}')">检测</button>
+          <button class="ghost" onclick="setTiming('${s.id}', ${s.report_interval || 0}, ${s.fail_threshold || 0})">上报</button>
+          <button class="ghost" onclick="clearServer('${s.id}', '${esc(s.name)}')">清空</button>
+          <button class="ghost" onclick="delServer('${s.id}', '${esc(s.name)}')">删除</button>
+        </td>
+      </tr>`;
+    }).join('') || '<tr><td class="muted" colspan="9">暂无服务器</td></tr>';
   } catch (e) {
     if (String(e.message).startsWith('401')) return logout();
     say('srvMsg', '读取失败: ' + e.message, 'err');
@@ -624,6 +647,15 @@ async function setTiming(id, curInterval, curThreshold) {
 function flagEmoji(code) {
   if (!/^[A-Za-z]{2}$/.test(code)) return '';
   return String.fromCodePoint(...[...code.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65));
+}
+// 清空单台采集数据（服务器与配置保留）
+async function clearServer(id, name) {
+  if (!confirm(`清空服务器「${name}」的全部采集数据？主机与配置保留，此操作不可恢复。`)) return;
+  try {
+    const r = await api('DELETE', `/api/admin/servers/${id}/metrics`);
+    say('srvMsg', `已清空「${name}」的 ${r.deleted} 条采集数据`, 'ok');
+    loadServers();
+  } catch (e) { say('srvMsg', '失败: ' + e.message, 'err'); }
 }
 async function delServer(id, name) {
   if (!confirm(`删除服务器「${name}」及其全部历史数据？此操作不可恢复。`)) return;

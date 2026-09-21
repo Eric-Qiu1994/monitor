@@ -50,6 +50,11 @@ pub fn router(state: AppState) -> Router {
             "/api/admin/servers/{id}/timing",
             put(set_server_timing),
         )
+        // 清空单服务器采集历史（保留服务器行与配置）
+        .route(
+            "/api/admin/servers/{id}/metrics",
+            delete(clear_server_metrics),
+        )
         // 主题
         .route("/api/themes", get(list_themes))
         .route("/api/themes", post(create_theme))
@@ -423,6 +428,7 @@ async fn report(
         if let Some(cc) = &country {
             db::set_server_country(&conn, &id, cc)?;
         }
+        db::set_server_ips(&conn, &id, &r.ipv4, &r.ipv6)?;
         db::insert_metric(&conn, &r, &id)?;
         Ok(())
     })();
@@ -458,6 +464,7 @@ async fn list_servers(State(st): State<Arc<AppState>>) -> Response {
                     "cpu_name": s.cpu_name, "cpu_cores": s.cpu_cores,
                     "note": s.note, "last_seen": s.last_seen, "online": online,
                     "country": s.country,
+                    "ipv4": s.ipv4, "ipv6": s.ipv6,
                     "report_interval": s.report_interval, "fail_threshold": s.fail_threshold,
                     "latest": latest,
                 })
@@ -1036,6 +1043,27 @@ async fn set_server_timing(
 
 // ---------- 网站监控 ----------
 
+async fn clear_server_metrics(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authorize_admin(&st, &headers) {
+        return e;
+    }
+    let conn = st.db.lock().unwrap();
+    if !db::server_exists(&conn, &id).unwrap_or(false) {
+        return (StatusCode::NOT_FOUND, "no such server").into_response();
+    }
+    match db::clear_server_metrics(&conn, &id) {
+        Ok(n) => Json(json!({ "ok": true, "deleted": n })).into_response(),
+        Err(e) => {
+            log::error!("clear server metrics: {e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "clear failed").into_response()
+        }
+    }
+}
+
 async fn list_sites(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(e) = authorize_admin(&st, &headers) {
         return e;
@@ -1327,6 +1355,10 @@ async fn backup_export(State(st): State<Arc<AppState>>, headers: HeaderMap) -> R
             "dash_probe_hours": db::kv_get(&conn, "dash_probe_hours", "8"),
             "dash_loss_hours": db::kv_get(&conn, "dash_loss_hours", "8"),
             "report_interval": db::kv_get(&conn, "report_interval", "0"),
+            "dash_avg_latency_hours": db::kv_get(&conn, "dash_avg_latency_hours", "8"),
+            "dash_avg_loss_hours": db::kv_get(&conn, "dash_avg_loss_hours", "8"),
+            "dash_show_regions": db::kv_get(&conn, "dash_show_regions", "1"),
+            "dash_show_flags": db::kv_get(&conn, "dash_show_flags", "1"),
         },
         "probe_targets": db::probe_targets_all(&conn).unwrap_or_default(),
         // 单台服务器的探测点排除（按 target 地址，恢复时不受 id 漂移影响）

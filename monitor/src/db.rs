@@ -53,7 +53,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             cpu_cores   INTEGER NOT NULL DEFAULT 0,
             note        TEXT NOT NULL DEFAULT '',
             created_at  TEXT NOT NULL,
-            last_seen   TEXT NOT NULL
+            last_seen   TEXT NOT NULL,
+            ipv4        TEXT NOT NULL DEFAULT '',
+            ipv6        TEXT NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS metrics (
@@ -587,6 +589,13 @@ fn migrate_metrics_probe_columns(conn: &Connection) -> Result<()> {
     if !snames.contains("fail_threshold") {
         conn.execute_batch("ALTER TABLE servers ADD COLUMN fail_threshold INTEGER NOT NULL DEFAULT 0")?;
     }
+    // servers.ipv4 / ipv6：agent 自采的本机地址（空串 = 未上报）
+    if !snames.contains("ipv4") {
+        conn.execute_batch("ALTER TABLE servers ADD COLUMN ipv4 TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !snames.contains("ipv6") {
+        conn.execute_batch("ALTER TABLE servers ADD COLUMN ipv6 TEXT NOT NULL DEFAULT ''")?;
+    }
     Ok(())
 }
 
@@ -675,6 +684,22 @@ pub fn upsert_server(
     Ok(())
 }
 
+/// 记录 agent 上报的本机地址；旧 agent 上报空串时保留库里已有值。
+pub fn set_server_ips(conn: &Connection, id: &str, ipv4: &str, ipv6: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE servers SET ipv4=CASE WHEN ?2<>'' THEN ?2 ELSE ipv4 END,
+                            ipv6=CASE WHEN ?3<>'' THEN ?3 ELSE ipv6 END
+         WHERE id=?1",
+        params![id, ipv4, ipv6],
+    )?;
+    Ok(())
+}
+
+/// 清空单台服务器的采集历史（保留服务器行与探测点排除配置）
+pub fn clear_server_metrics(conn: &Connection, id: &str) -> Result<u64> {
+    Ok(conn.execute("DELETE FROM metrics WHERE server_id=?1", params![id])? as u64)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn insert_metric(conn: &Connection, r: &monitor_common::Report, id: &str) -> Result<()> {
     // 多目标结果为空时，把单目标 probe 也塞进数组，仪表盘只认 probes 就够了
@@ -741,12 +766,15 @@ pub struct ServerRow {
     pub report_interval: u64,
     /// 连续上报失败判离线次数，0 = 用全局默认
     pub fail_threshold: u64,
+    /// 本机 IPv4 / IPv6（agent 上报的最新值）
+    pub ipv4: String,
+    pub ipv6: String,
 }
 
 pub fn servers(conn: &Connection) -> Result<Vec<ServerRow>> {
     let mut st = conn.prepare(
         "SELECT id, name, hostname, os, arch, kernel, cpu_name, cpu_cores, note, country, last_seen,
-                report_interval, fail_threshold
+                report_interval, fail_threshold, ipv4, ipv6
          FROM servers ORDER BY name",
     )?;
     let rows = st
@@ -765,6 +793,8 @@ pub fn servers(conn: &Connection) -> Result<Vec<ServerRow>> {
                 last_seen: r.get(10)?,
                 report_interval: r.get::<_, i64>(11)?.max(0) as u64,
                 fail_threshold: r.get::<_, i64>(12)?.max(0) as u64,
+                ipv4: r.get(13)?,
+                ipv6: r.get(14)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
