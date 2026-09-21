@@ -242,12 +242,34 @@ function multichart(series, opts) {
 }
 
 /// 流量汇总成一行：下载速率 / 上传速率 / 区间累计 / 总累计（各子开关独立控制）
+/// 速率窗口固定 5 分钟（不受 viewHours 影响——"实时流量"就该是实时的）；
+/// 区间累计/总计仍按 viewHours 窗口与全程。
+/// ponytail: 速率窗口写死 5 分钟。上报间隔 >5min 的机器会退化成"最近两点差值/间隔"，
+///          比全窗口均值准；要可调再说（改 RATE_WINDOW_SEC 一处即可）。
+const RATE_WINDOW_SEC = 300;
 function traffic(hist) {
   if (!dashCfg.showTraffic || hist.length < 2) return '';
-  const a = hist[0], b = hist[hist.length - 1];
-  const dt = (new Date(b.ts) - new Date(a.ts)) / 1000;
-  if (dt <= 0) return '';
-  const rxs = Math.max(0, b.net_rx - a.net_rx) / dt, txs = Math.max(0, b.net_tx - a.net_tx) / dt;
+  // 按 viewHours 裁剪（与图表窗口一致），否则 hist[0] 可能是很久以前的点
+  const cut = Date.now() - viewHours * 3600e3;
+  const win = hist.filter(h => Date.parse(h.ts) >= cut);
+  if (win.length < 2) return '';
+  const a = win[0], b = win[win.length - 1];
+
+  // 速率：只取最近 5 分钟内的点；计数器回绕（重启/溢出 → 差值变负）跳过该点而非压成 0
+  const rateCut = Date.now() - RATE_WINDOW_SEC * 1000;
+  const rp = win.filter(h => Date.parse(h.ts) >= rateCut);
+  let rxs = 0, txs = 0;
+  if (rp.length >= 2) {
+    let dRx = 0, dTx = 0, dt = 0, prev = rp[0];
+    for (const cur of rp.slice(1)) {
+      const dr = cur.net_rx - prev.net_rx, dtx = cur.net_tx - prev.net_tx;
+      const d = (Date.parse(cur.ts) - Date.parse(prev.ts)) / 1000;
+      if (d > 0 && dr >= 0 && dtx >= 0) { dRx += dr; dTx += dtx; dt += d; }
+      prev = cur;   // 回绕点本身不参与下一段，但保留为下一段起点会再跳过一次——可接受
+    }
+    if (dt > 0) { rxs = dRx / dt; txs = dTx / dt; }
+  }
+
   const rxWindow = Math.max(0, b.net_rx - a.net_rx), txWindow = Math.max(0, b.net_tx - a.net_tx);
   // 子开关缺省 true（老配置没有这些键时保持原样显示）
   const c = k => dashCfg[k] !== false;
@@ -524,7 +546,10 @@ async function refresh() {
     // 拉取量需同时覆盖：查看范围 viewHours + 卡片均值配置时长（avgLatencyHours/avgLossHours）
     // ponytail: 上限 9000 点（24h@10s=8640），超配时均值窗口自动被截短
     const maxH = Math.max(viewHours, dashCfg.avgLatencyHours || 8, dashCfg.avgLossHours || 8);
-    const n = Math.min(9000, Math.max(60, Math.ceil(maxH * 3600 / 10)));
+    // 按最大上报间隔算点数：取多了被 viewHours 裁掉，取少了窗口不够——保守多取
+    // ponytail: 用全体 server 的最大间隔（不是各拉各的），多拉的点被 viewHours 裁掉，代价可控
+    const iv = Math.max(10, ...servers.map(s => s.report_interval || 0));
+    const n = Math.min(9000, Math.max(60, Math.ceil(maxH * 3600 / iv)));
     const hist = await Promise.all(servers.map(s =>
       fetch(`/api/servers/${s.id}/history?n=${n}`).then(r => r.json()).catch(() => [])));
     const cards = document.getElementById('cards');
