@@ -55,7 +55,11 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             created_at  TEXT NOT NULL,
             last_seen   TEXT NOT NULL,
             ipv4        TEXT NOT NULL DEFAULT '',
-            ipv6        TEXT NOT NULL DEFAULT ''
+            ipv6        TEXT NOT NULL DEFAULT '',
+            client_version TEXT NOT NULL DEFAULT '',
+            listen_port INTEGER NOT NULL DEFAULT 0,
+            agent_token   TEXT NOT NULL DEFAULT '',
+            agent_addr    TEXT NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS metrics (
@@ -596,6 +600,20 @@ fn migrate_metrics_probe_columns(conn: &Connection) -> Result<()> {
     if !snames.contains("ipv6") {
         conn.execute_batch("ALTER TABLE servers ADD COLUMN ipv6 TEXT NOT NULL DEFAULT ''")?;
     }
+    // servers.client_version / listen_port / agent_token：让 monitor 能主动 ping agent 触发上报
+    if !snames.contains("client_version") {
+        conn.execute_batch("ALTER TABLE servers ADD COLUMN client_version TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !snames.contains("listen_port") {
+        conn.execute_batch("ALTER TABLE servers ADD COLUMN listen_port INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !snames.contains("agent_token") {
+        conn.execute_batch("ALTER TABLE servers ADD COLUMN agent_token TEXT NOT NULL DEFAULT ''")?;
+    }
+    // servers.agent_addr：agent 主动上报的反向连接地址（NAT 主机可手动覆盖）
+    if !snames.contains("agent_addr") {
+        conn.execute_batch("ALTER TABLE servers ADD COLUMN agent_addr TEXT NOT NULL DEFAULT ''")?;
+    }
     Ok(())
 }
 
@@ -695,6 +713,39 @@ pub fn set_server_ips(conn: &Connection, id: &str, ipv4: &str, ipv6: &str) -> Re
     Ok(())
 }
 
+/// 记录 agent 端反向触发通道的连接信息（IP:port + 令牌）。
+/// 空串/0=端口保留旧值，避免升级期老 agent 上报不带这些字段时被清空。
+/// 记录 agent 端反向触发通道的连接信息。
+/// 全部字段都用"空值/0 保留旧值"语义，确保老 agent 上报不带这些字段时不擦除。
+/// listen_addr 由 report() 端从 connect_info 直接补，agent_addr 由 agent 上报或后台手填覆盖。
+pub fn set_server_trigger_info(
+    conn: &Connection,
+    id: &str,
+    listen_port: u16,
+    agent_token: &str,
+    client_version: &str,
+    agent_addr: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE servers SET
+            listen_port   = CASE WHEN ?2 > 0       THEN ?2 ELSE listen_port END,
+            agent_token   = CASE WHEN ?3 <> ''     THEN ?3 ELSE agent_token END,
+            client_version= CASE WHEN ?4 <> ''     THEN ?4 ELSE client_version END,
+            agent_addr    = CASE WHEN ?5 <> ''     THEN ?5 ELSE agent_addr END
+         WHERE id = ?1",
+        params![id, listen_port as i64, agent_token, client_version, agent_addr],
+    )?;
+    Ok(())
+}
+
+/// 由 admin 端修改 agent_addr（NAT 主机场景必须手动覆盖）
+pub fn set_server_agent_addr(conn: &Connection, id: &str, addr: &str) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE servers SET agent_addr=?2 WHERE id=?1",
+        params![id, addr],
+    )? > 0)
+}
+
 /// 清空单台服务器的采集历史（保留服务器行与探测点排除配置）
 pub fn clear_server_metrics(conn: &Connection, id: &str) -> Result<u64> {
     Ok(conn.execute("DELETE FROM metrics WHERE server_id=?1", params![id])? as u64)
@@ -769,12 +820,17 @@ pub struct ServerRow {
     /// 本机 IPv4 / IPv6（agent 上报的最新值）
     pub ipv4: String,
     pub ipv6: String,
+    pub client_version: String,
+    pub listen_port: u16,
+    pub agent_token: String,
+    pub agent_addr: String,
 }
 
 pub fn servers(conn: &Connection) -> Result<Vec<ServerRow>> {
     let mut st = conn.prepare(
         "SELECT id, name, hostname, os, arch, kernel, cpu_name, cpu_cores, note, country, last_seen,
-                report_interval, fail_threshold, ipv4, ipv6
+                report_interval, fail_threshold, ipv4, ipv6,
+                client_version, listen_port, agent_token, agent_addr
          FROM servers ORDER BY name",
     )?;
     let rows = st
@@ -795,6 +851,10 @@ pub fn servers(conn: &Connection) -> Result<Vec<ServerRow>> {
                 fail_threshold: r.get::<_, i64>(12)?.max(0) as u64,
                 ipv4: r.get(13)?,
                 ipv6: r.get(14)?,
+                client_version: r.get(15)?,
+                listen_port: r.get::<_, i64>(16)?.max(0) as u16,
+                agent_token: r.get(17)?,
+                agent_addr: r.get(18)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1091,6 +1151,9 @@ mod tests {
         monitor_common::Report {
             ts: ts.into(),
             hostname: host.into(),
+            client_version: "0.1.7".into(),
+            listen_port: 9119,
+            agent_token: "test-token".into(),
             cpu_usage: 10.0,
             cpu_cores: 2,
             mem_total: 1000,

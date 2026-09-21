@@ -55,6 +55,19 @@ pub fn router(state: AppState) -> Router {
             "/api/admin/servers/{id}/metrics",
             delete(clear_server_metrics),
         )
+        // 主动触发 agent 立即上报（中心机 → agent /trigger）
+        .route(
+            "/api/admin/servers/{id}/trigger",
+            post(trigger_server),
+        )
+        // 修改 agent 反向连接地址（NAT 场景用户手动覆盖）
+        .route(
+            "/api/admin/servers/{id}/addr",
+            put(set_server_addr),
+        )
+        // agent 自更新：返回最新版本号 + 各架构 sha256
+        .route("/api/agent-version", get(agent_version))
+        // agent 二进制下载端点 /agent-bin/{file} 已存在（见 line 30），复用它
         // 主题
         .route("/api/themes", get(list_themes))
         .route("/api/themes", post(create_theme))
@@ -429,6 +442,10 @@ async fn report(
             db::set_server_country(&conn, &id, cc)?;
         }
         db::set_server_ips(&conn, &id, &r.ipv4, &r.ipv6)?;
+        // agent_addr：agent 上报优先（NAT 场景由用户手动覆盖），否则用 monitor 看到的来源 IP
+        let connect_ip = connect.0.ip().to_string();
+        let agent_addr = if r.agent_addr.trim().is_empty() { connect_ip } else { r.agent_addr.clone() };
+        db::set_server_trigger_info(&conn, &id, r.listen_port, &r.agent_token, &r.client_version, &agent_addr)?;
         db::insert_metric(&conn, &r, &id)?;
         Ok(())
     })();
@@ -465,6 +482,10 @@ async fn list_servers(State(st): State<Arc<AppState>>) -> Response {
                     "note": s.note, "last_seen": s.last_seen, "online": online,
                     "country": s.country,
                     "ipv4": s.ipv4, "ipv6": s.ipv6,
+                    "client_version": s.client_version,
+                    "listen_port": s.listen_port,
+                    "agent_token": s.agent_token,
+                    "agent_addr": s.agent_addr,
                     "report_interval": s.report_interval, "fail_threshold": s.fail_threshold,
                     "latest": latest,
                 })
@@ -491,19 +512,18 @@ fn filter_excluded_probes(conn: &rusqlite::Connection, server_id: &str, probes: 
     });
 }
 
-/// 超过 3 个上报周期没动静算离线；窗口跟随后台配置的 report_interval
-/// （默认 10s 时为 30s；设 5 分钟则放宽到 15 分钟；下限 35s 防 interval=0 误判）
-/// ponytail: 取消了原 600 秒宽限（旧理由是「间隔从大改小时旧 agent 还没醒」，
-/// 现在后台统一下发 report_interval 后不再需要）。
-pub fn online_window_secs(report_interval: u64) -> i64 {
-    (report_interval.max(1) as i64 * 3).max(35)
+/// 离线窗口（秒）= 上报间隔 × 主动探测次数（fail_threshold）。
+/// ponytail: 语义从「间隔×3」改为「间隔×N」——中心机到点未上报还能主动探 N 次，
+/// N 次后仍未恢复才判离线。fail_threshold 默认 3，下限 35s 防 interval 极小误判。
+pub fn online_window_secs(report_interval: u64, probe_attempts: u64) -> i64 {
+    ((report_interval.max(1) as i64) * probe_attempts.max(1) as i64).max(35)
 }
 
 fn is_online(last_seen: &str, report_interval: u64) -> bool {
     match chrono::DateTime::parse_from_rfc3339(last_seen) {
         Ok(t) => {
             chrono::Utc::now().signed_duration_since(t.with_timezone(&chrono::Utc))
-                < chrono::Duration::seconds(online_window_secs(report_interval))
+                < chrono::Duration::seconds(online_window_secs(report_interval, 3))
         }
         Err(_) => false,
     }
@@ -1062,6 +1082,99 @@ async fn clear_server_metrics(
             (StatusCode::INTERNAL_SERVER_ERROR, "clear failed").into_response()
         }
     }
+}
+
+/// 主动触发 agent 立即上报：拿 agent.listen_port + agent_token 拼出反向通道 URL，
+/// 发 GET 请求，agent 收到后置 flag → 主线程立即采集并 POST。3 秒超时。
+async fn trigger_server(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authorize_admin(&st, &headers) {
+        return e;
+    }
+    let (port, token, agent_addr) = {
+        let conn = st.db.lock().unwrap();
+        let s = match db::servers(&conn) {
+            Ok(v) => v.into_iter().find(|x| x.id == id),
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "query failed").into_response(),
+        };
+        let Some(s) = s else { return (StatusCode::NOT_FOUND, "no such server").into_response(); };
+        if s.listen_port == 0 || s.agent_token.is_empty() {
+            return (StatusCode::BAD_REQUEST, "agent 未开启反向通道（listen_port=0 或 token 为空）").into_response();
+        }
+        // agent_addr 优先：agent 上报时填或后台手填；空时回退 127.0.0.1（同机部署）。
+        let addr = if s.agent_addr.trim().is_empty() { "127.0.0.1".to_string() } else { s.agent_addr.clone() };
+        (s.listen_port, s.agent_token.clone(), addr)
+    };
+    let url = format!("http://{agent_addr}:{port}/trigger?token={token}");
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(3)))
+            .build(),
+    );
+    match agent.get(&url).call() {
+        Ok(r) if r.status().as_u16() < 400 => Json(json!({"ok": true})).into_response(),
+        Ok(r) => (StatusCode::BAD_GATEWAY, format!("agent 返回 {}", r.status())).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("触发失败: {e}")).into_response(),
+    }
+}
+
+/// 后台手动覆盖 agent 反向连接地址（NAT 主机场景——monitor 看到的 IP 无法回连）
+async fn set_server_addr(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(b): Json<AgentAddrBody>,
+) -> Response {
+    if let Err(e) = authorize_admin(&st, &headers) {
+        return e;
+    }
+    let conn = st.db.lock().unwrap();
+    let addr = b.agent_addr.trim();
+    if !addr.is_empty() && addr.parse::<std::net::IpAddr>().is_err() {
+        return (StatusCode::BAD_REQUEST, "agent_addr 必须是合法 IP 或留空").into_response();
+    }
+    match db::set_server_agent_addr(&conn, &id, addr) {
+        Ok(true) => Json(json!({"ok": true, "agent_addr": addr})).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such server").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("set failed: {e}")).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AgentAddrBody {
+    agent_addr: String,
+}
+
+/// agent 自更新：返回最新版本号 + 各架构二进制 sha256
+/// ponytail: sha256sum.txt 在 release 时生成（release.sh 干这事），运行时读。
+/// 找不到就只返回 version——agent 会按"没有 sha256"中止自更新（已是 fail-fast）。
+async fn agent_version() -> Response {
+    let ver = env!("CARGO_PKG_VERSION").to_string();
+    // 与 agent_bin 共用候选目录列表——部署时把 sha256sum.txt 放在同目录即可
+    let mut candidates = vec!["/usr/local/share/monitor/agent-bin".to_string()];
+    if let Ok(d) = std::env::var("MONITOR_AGENT_BIN_DIR") {
+        candidates.insert(0, d);
+    }
+    candidates.push("dist".into());
+    let mut sha: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for dir in candidates {
+        let p = std::path::Path::new(&dir).join("sha256sum.txt");
+        if let Ok(raw) = std::fs::read_to_string(&p) {
+            for line in raw.lines() {
+                let mut it = line.split_whitespace();
+                if let (Some(h), Some(p)) = (it.next(), it.next()) {
+                    if let Some(name) = p.strip_prefix("dist/") {
+                        sha.insert(name.to_string(), h.to_string());
+                    }
+                }
+            }
+            break;
+        }
+    }
+    Json(json!({"version": ver, "sha256": sha})).into_response()
 }
 
 async fn list_sites(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1819,11 +1932,13 @@ mod tests {
         // 5 分钟上报周期 → 15 分钟窗口
         assert!(is_online(&(now - chrono::Duration::seconds(600)).to_rfc3339(), 300));
         assert!(!is_online(&(now - chrono::Duration::seconds(901)).to_rfc3339(), 300));
-        assert_eq!(online_window_secs(0), 35);   // 下限兜底
-        assert_eq!(online_window_secs(10), 35);  // 3*10=30，下限 35 兜底
-        assert_eq!(online_window_secs(12), 36);  // 3*12=36，超过下限
-        assert_eq!(online_window_secs(300), 900); // 3 * 5min
-        assert_eq!(online_window_secs(5), 35);   // 15s < 35s 下限
+        assert_eq!(online_window_secs(0, 3), 35);   // 下限兜底
+        assert_eq!(online_window_secs(10, 3), 35);  // 3*10=30，下限 35 兜底
+        assert_eq!(online_window_secs(12, 3), 36);  // 3*12=36，超过下限
+        assert_eq!(online_window_secs(300, 3), 900); // 3 * 5min
+        assert_eq!(online_window_secs(5, 3), 35);   // 15s < 35s 下限
+        assert_eq!(online_window_secs(60, 5), 300); // 5 次主动探测
+        assert_eq!(online_window_secs(60, 0), 60); // N=0 → 默认 1
     }
 
     #[test]

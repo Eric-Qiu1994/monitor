@@ -70,6 +70,19 @@ pub struct Report {
     pub ipv4: String,
     #[serde(default)]
     pub ipv6: String,
+    /// agent 二进制版本（clap 自动注入 CARGO_PKG_VERSION）；空串 = 旧 agent 未上报
+    #[serde(default)]
+    pub client_version: String,
+    /// agent 监听的反向触发端口（0 = 旧 agent 或禁用）
+    #[serde(default)]
+    pub listen_port: u16,
+    /// agent 随机生成的触发令牌，monitor 主动探测时回传
+    #[serde(default)]
+    pub agent_token: String,
+    /// agent 主动上报的"反向连接可达地址"——空串时 monitor 端用 connect_info IP。
+    /// 跨 NAT 场景需要用户手动填（NAT 后 IP monitor 不可达）。
+    #[serde(default)]
+    pub agent_addr: String,
 }
 
 impl Report {

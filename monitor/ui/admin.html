@@ -141,9 +141,9 @@ dialog::backdrop { background: rgba(0,0,0,.45); }
           <thead><tr>
             <th>别名</th><th>名称</th><th>状态</th><th>磁盘</th>
             <th class="mono">IPv4</th><th class="mono">IPv6</th>
-            <th>系统</th><th>地区</th><th>操作</th>
+            <th>系统</th><th>版本</th><th>地址</th><th>地区</th><th>操作</th>
           </tr></thead>
-          <tbody id="srvList"><tr><td class="muted" colspan="9">加载中…</td></tr></tbody>
+          <tbody id="srvList"><tr><td class="muted" colspan="11">加载中…</td></tr></tbody>
         </table>
       </div>
       <div class="msg" id="srvMsg"></div>
@@ -278,7 +278,7 @@ dialog::backdrop { background: rgba(0,0,0,.45); }
         <option value="120">2 分钟</option>
         <option value="300">5 分钟</option>
       </select>
-      <label for="setFailThreshold">连续上报失败判离线次数（1–100，agent 重试间隔固定 10 秒）</label>
+      <label for="setFailThreshold">主动探测次数（1–100：中心机到点未收到上报时主动触发 agent 的最大次数，超过即判离线）</label>
       <input id="setFailThreshold" type="number" min="1" max="100" value="3">
       <div class="btns">
         <button onclick="saveSettings()">保存设置</button>
@@ -568,21 +568,59 @@ async function loadServers() {
         <td class="mono">${esc(s.ipv4 || '—')}</td>
         <td class="mono">${esc(s.ipv6 || '—')}</td>
         <td class="muted">${esc(s.os || '—')}</td>
+        <td class="mono">${esc(s.client_version || '—')}</td>
+        <td class="mono" title="${esc(s.agent_addr || '')}（NAT 主机需手动覆盖）" onclick="editAddr('${s.id}', '${esc(s.agent_addr || '')}')" style="cursor:pointer">${esc(s.agent_addr || '—')}</td>
         <td class="muted">${s.country ? `${flagEmoji(s.country)} ${esc(s.country)}` : '—'}</td>
         <td>
           <button class="ghost" onclick="renameServer('${s.id}', '${esc(s.name)}')">改名</button>
+          <button class="ghost" onclick="triggerServer('${s.id}', '${esc(s.name)}')">主动</button>
           <button class="ghost" onclick="openProbeDlg('${s.id}', '${esc(s.name)}')">检测</button>
           <button class="ghost" onclick="setTiming('${s.id}', ${s.report_interval || 0}, ${s.fail_threshold || 0})">上报</button>
           <button class="ghost" onclick="clearServer('${s.id}', '${esc(s.name)}')">清空</button>
           <button class="ghost" onclick="delServer('${s.id}', '${esc(s.name)}')">删除</button>
         </td>
       </tr>`;
-    }).join('') || '<tr><td class="muted" colspan="9">暂无服务器</td></tr>';
+    }).join('') || '<tr><td class="muted" colspan="11">暂无服务器</td></tr>';
   } catch (e) {
     if (String(e.message).startsWith('401')) return logout();
     say('srvMsg', '读取失败: ' + e.message, 'err');
   }
 }
+// 编辑 agent_addr（NAT 场景手动覆盖反向连接地址；空串 = 自动用上报来源 IP）
+async function editAddr(id, cur) {
+  const v = prompt('agent 反向连接地址（NAT 主机填公网回连可达的 IP/DNS；留空则用 agent 上报时的来源 IP）', cur || '');
+  if (v === null) return;
+  try {
+    await api('PUT', `/api/admin/servers/${id}/addr`, { agent_addr: v.trim() });
+    say('srvMsg', v.trim() ? `已设置 agent_addr = ${v.trim()}` : '已清空，下一次上报时自动用来源 IP', 'ok');
+    loadServers();
+  } catch (e) {
+    if (String(e.message).startsWith('400')) say('srvMsg', '地址格式不合法（必须是 IP 或留空）', 'err');
+    else say('srvMsg', '设置失败: ' + e.message, 'err');
+  }
+}
+
+// 主动触发：中心机 → agent /trigger → agent 立即采集上报
+async function triggerServer(id, name) {
+  try {
+    const r = await api('POST', `/api/admin/servers/${id}/trigger`);
+    say('srvMsg', `已触发「${name}」主动上报，等待 agent 响应（最长 ~3 秒）`, 'ok');
+  } catch (e) {
+    if (String(e.message).startsWith('400')) {
+      say('srvMsg', `「${name}」的 agent 未开启反向通道（需升级到 v0.1.7+）`, 'err');
+    } else if (String(e.message).startsWith('502')) {
+      const servers = await api('GET', '/api/servers');
+      const s = servers.find(x => x.id === id);
+      say('srvMsg', `「${name}」agent 联系不上（当前地址 ${s?.agent_addr || '127.0.0.1'}）；NAT 主机请点表格「地址」列手动覆盖`, 'err');
+      loadServers();
+    } else if (String(e.message).startsWith('404')) {
+      say('srvMsg', `「${name}」不存在`, 'err');
+    } else {
+      say('srvMsg', '触发失败: ' + e.message, 'err');
+    }
+  }
+}
+
 // 单服务器探测点：默认全部启用，取消勾选 = 排除
 let probeDlgServer = null;
 async function openProbeDlg(id, name) {
@@ -633,7 +671,7 @@ async function renameServer(id, cur) {
 async function setTiming(id, curInterval, curThreshold) {
   const ri = prompt('上报间隔秒（0 = 用系统设置全局值，最大 3600）', String(curInterval));
   if (ri == null) return;
-  const ft = prompt('连续上报失败判离线次数（0 = 用系统设置全局值，最大 100）', String(curThreshold));
+  const ft = prompt('主动探测次数（agent 未按时上报时中心机主动触发的次数，0 = 用系统设置全局值，最大 100）', String(curThreshold));
   if (ft == null) return;
   try {
     await api('PUT', `/api/admin/servers/${id}/timing`, {

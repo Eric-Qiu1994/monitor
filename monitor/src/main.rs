@@ -194,14 +194,20 @@ fn site_checker_loop(db: db::Db) {
     }
 }
 
-/// 离线通知循环：每 30s 检查一次状态翻转的服务器。
+/// 离线通知循环 + 主动探测循环：每 30s 醒一次。
 /// 状态机：
 ///   离线→在线：发一次恢复通知
 ///   在线→离线：发一次离线通知
-/// ponytail: 状态全靠 HashSet 记忆，进程重启会把"已知离线"判为"刚离线"重发一次，可接受。
+/// 主动探测：
+///   中心机到点（last_seen 老于 1 个 interval）但仍未上报 → 对 agent /trigger GET 一次
+///   agent 收到 → 立即采集并上报 → last_seen 刷新 → 计数归零
+///   失败 → 计数 +1；到 fail_threshold 仍未恢复 → UI 显示离线（last_seen 太老）
+/// ponytail: 状态全靠 HashMap 记忆，进程重启会重置计数，可接受；
+/// ureq 同步调用足够——探测频率 30s × 服务器数，量级在 100 台以下毫无压力。
 fn offline_notify_loop(db: db::Db) {
-    // true = 上次看到时在线，false = 上次看到时离线；不在集合内视为首次观察。
     let mut prev_online: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    // 每台累计主动探测失败次数；agent 成功上报后由 last_seen 重置（见循环内归零逻辑）。
+    let mut probe_fail: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     loop {
         std::thread::sleep(Duration::from_secs(30));
         let cfg = {
@@ -229,7 +235,7 @@ fn offline_notify_loop(db: db::Db) {
             let eff_interval = if s.report_interval > 0 { s.report_interval } else { interval };
             let online = match last {
                 Some(t) => now.signed_duration_since(t)
-                    < chrono::Duration::seconds(api::online_window_secs(eff_interval)),
+                    < chrono::Duration::seconds(api::online_window_secs(eff_interval, 3)),
                 None => false,
             };
             let prev = prev_online.get(&s.id).copied();
@@ -268,6 +274,50 @@ fn offline_notify_loop(db: db::Db) {
                     }
                 }
                 prev_online.insert(s.id.clone(), false);
+            }
+            // 主动探测：last_seen 比 eff_interval 还老（到点就该报）→ 探一次。
+            // 已累计失败到 fail_threshold 就停手，让 UI 自然显示离线，不再继续打噪音。
+            let due_for_probe = match last {
+                Some(t) => now.signed_duration_since(t)
+                    >= chrono::Duration::seconds(eff_interval as i64),
+                None => true,
+            };
+            let attempts = *probe_fail.get(&s.id).unwrap_or(&0);
+            let global_threshold: u64 = db::kv_get(&db.lock().unwrap(), "fail_threshold", "3")
+                .parse().unwrap_or(3).clamp(1, 100);
+            let per_server_threshold = if s.fail_threshold > 0 { s.fail_threshold } else { global_threshold };
+            let probe_addr = if s.agent_addr.trim().is_empty() { "127.0.0.1" } else { s.agent_addr.as_str() };
+            if due_for_probe && attempts < per_server_threshold
+                && s.listen_port > 0 && !s.agent_token.is_empty() {
+                let url = format!("http://{probe_addr}:{}/trigger?token={}",
+                    s.listen_port, s.agent_token);
+                let probe_agent = ureq::Agent::new_with_config(
+                    ureq::Agent::config_builder()
+                        .timeout_global(Some(std::time::Duration::from_secs(3)))
+                        .build(),
+                );
+                match probe_agent.get(&url).call() {
+                    Ok(r) if r.status().as_u16() < 400 => {
+                        // 触发成功：等下一轮 tick 时 last_seen 会刷新，计数自然归零。
+                        log::debug!("主动触发 {} 成功（{}次累计）", node, attempts);
+                    }
+                    Ok(r) => {
+                        let n = attempts + 1;
+                        probe_fail.insert(s.id.clone(), n);
+                        log::info!("主动探测 {} 失败 {}/{}：agent 返回 {}",
+                            node, n, per_server_threshold, r.status());
+                    }
+                    Err(e) => {
+                        let n = attempts + 1;
+                        probe_fail.insert(s.id.clone(), n);
+                        log::info!("主动探测 {} 失败 {}/{}：{}",
+                            node, n, per_server_threshold, e);
+                    }
+                }
+            }
+            // 探测成功时清零失败计数（agent 上报后 last_seen 会变成新值，next tick 不进 due 分支）
+            if !due_for_probe {
+                probe_fail.remove(&s.id);
             }
         }
     }

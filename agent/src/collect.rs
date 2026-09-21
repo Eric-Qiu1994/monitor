@@ -49,6 +49,11 @@ pub struct Collector {
     // ponytail: 全局一个缓存，多主机共享——NAT 主机公网 IP 几乎不变，
     // 真有变动用户重启 agent 即可；要做 per-host 缓存再加 HashMap<String,(String,String)>
     public_ips: Option<(String, String, Instant)>,
+    pub client_version: String,
+    pub listen_port: u16,
+    pub agent_token: String,
+    /// 反向连接可达地址（NAT 主机环境用户手动配）；空 = monitor 用上报来源 IP
+    pub agent_addr: String,
 }
 
 impl Collector {
@@ -65,6 +70,10 @@ impl Collector {
             disks: Disks::new_with_refreshed_list(),
             hostname: hostname.map(str::to_string),
             public_ips: None,
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            listen_port: 0,
+            agent_token: String::new(),
+            agent_addr: String::new(),
         }
     }
 
@@ -169,6 +178,10 @@ impl Collector {
             processes: self.sys.processes().len() as u64,
             ipv4,
             ipv6,
+            client_version: self.client_version.clone(),
+            listen_port: self.listen_port,
+            agent_token: self.agent_token.clone(),
+            agent_addr: self.agent_addr.clone(),
         })
     }
 }
